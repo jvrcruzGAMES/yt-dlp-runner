@@ -308,3 +308,76 @@ async def test_write_info_json_download_flow(tmp_path, monkeypatch):
     assert found.exists()
 
 
+@pytest.mark.asyncio
+async def test_embedded_pot_provider_endpoints():
+    from app.embedded_pot import EmbeddedPotProvider
+    import httpx
+
+    provider = EmbeddedPotProvider(host="127.0.0.1", port=44160)
+    await provider.start()
+    assert provider.is_active is True
+
+    try:
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:44160", timeout=3.0) as client:
+            # 1. Ping / Health check
+            ping_resp = await client.get("/ping")
+            assert ping_resp.status_code == 200
+            assert ping_resp.json()["status"] == "ok"
+            assert "bgutil" in ping_resp.json()["service"]
+
+            # 2. Get POT token via GET
+            pot_get = await client.get("/get_pot?client=web&visitor_data=vis123")
+            assert pot_get.status_code == 200
+            pot_data = pot_get.json()
+            assert "pot" in pot_data
+            assert len(pot_data["pot"]) > 20
+            assert pot_data["client"] == "web"
+
+            # 3. Get POT token via POST
+            pot_post = await client.post("/get_pot", json={"client": "android", "visitor_data": "vis456"})
+            assert pot_post.status_code == 200
+            post_data = pot_post.json()
+            assert "pot" in post_data
+            assert post_data["client"] == "android"
+    finally:
+        await provider.stop()
+        assert provider.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_embedded_flaresolverr_endpoints():
+    from app.embedded_flaresolverr import EmbeddedFlareSolverr
+    import httpx
+
+    solver = EmbeddedFlareSolverr(host="127.0.0.1", port=48191)
+    await solver.start()
+    assert solver.is_active is True
+
+    try:
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:48191", timeout=5.0) as client:
+            # 1. Root / health
+            health_resp = await client.get("/")
+            assert health_resp.status_code == 200
+            assert health_resp.json()["status"] == "ok"
+            assert "FlareSolverr" in health_resp.json()["message"]
+
+            # 2. Solve request via POST /v1
+            solve_resp = await client.post(
+                "/v1",
+                json={
+                    "cmd": "request.get",
+                    "url": "http://127.0.0.1:48191/health",
+                    "maxTimeout": 5000,
+                }
+            )
+            assert solve_resp.status_code == 200
+            s_data = solve_resp.json()
+            assert s_data["status"] == "ok"
+            assert "solution" in s_data
+            assert s_data["solution"]["status"] == 200
+    finally:
+        await solver.stop()
+        assert solver.is_active is False
+
+
+

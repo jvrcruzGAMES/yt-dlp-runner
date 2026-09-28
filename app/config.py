@@ -29,11 +29,11 @@ class RunnerSettings(BaseSettings):
     DOWNLOADS_DIR: str = _default_downloads_dir()
     COOKIES_DIR: str = _default_cookies_dir()
 
-    FLARESOLVERR_URL: str = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191/v1")
+    FLARESOLVERR_URL: str = os.getenv("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1")
     FLARESOLVERR_PROXY: Optional[str] = os.getenv("FLARESOLVERR_PROXY", None)
     BGUTIL_POT_PROVIDER_URL: Optional[str] = os.getenv(
         "BGUTIL_POT_PROVIDER_URL",
-        os.getenv("POT_PROVIDER_URL", None)
+        os.getenv("POT_PROVIDER_URL", "http://127.0.0.1:4416")
     )
     MITMPROXY_PORT: int = 8192
     USE_FLARESOLVERR_PROXY: bool = True

@@ -12,6 +12,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from app.config import settings
 from app.downloader import downloader_manager
+from app.embedded_flaresolverr import embedded_flaresolverr
+from app.embedded_pot import embedded_pot_provider
 from app.flaresolverr_proxy import flaresolverr_proxy
 from app.plugins import plugin_manager
 from app.schemas import (
@@ -32,11 +34,15 @@ logger = logging.getLogger("yt_dlp_runner")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting yt-dlp runner supervisor...")
+    logger.info("Starting yt-dlp runner supervisor with embedded POT and FlareSolverr...")
+    await embedded_pot_provider.start()
+    await embedded_flaresolverr.start()
     await flaresolverr_proxy.start()
     yield
-    logger.info("Stopping yt-dlp runner supervisor...")
+    logger.info("Stopping yt-dlp runner supervisor and embedded services...")
     await flaresolverr_proxy.stop()
+    await embedded_flaresolverr.stop()
+    await embedded_pot_provider.stop()
 
 
 app = FastAPI(

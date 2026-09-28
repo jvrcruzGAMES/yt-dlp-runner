@@ -130,13 +130,34 @@ class EmbeddedFlareSolverr:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                await asyncio.sleep(0.5)
-                if self._process.returncode is None:
+
+                # Poll up to 3 seconds for the port to open
+                ready = False
+                for _ in range(30):
+                    if self._process.returncode is not None:
+                        break
+                    try:
+                        _, writer = await asyncio.open_connection(self.host, self.port)
+                        writer.close()
+                        await writer.wait_closed()
+                        ready = True
+                        break
+                    except Exception:
+                        await asyncio.sleep(0.1)
+
+                if ready and self._process.returncode is None:
                     self._running = True
                     logger.info(f"Official FlareSolverr (from source) active at http://{self.host}:{self.port}/v1")
                     return
                 else:
-                    logger.warning(f"Official FlareSolverr process exited (code {self._process.returncode}). Using embedded fallback server...")
+                    if self._process.returncode is None:
+                        try:
+                            self._process.terminate()
+                            await self._process.wait()
+                        except Exception:
+                            pass
+                    self._process = None
+                    logger.warning("Official FlareSolverr process did not open port in time. Using embedded fallback server...")
             except Exception as e:
                 logger.warning(f"Failed to launch official FlareSolverr process ({e}). Using embedded fallback server...")
 

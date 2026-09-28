@@ -183,7 +183,6 @@ def build_yt_dlp_command(
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-check-certificates",
-        "--no-interactive",
         "--force-overwrites",
         "--newline",
         "--no-playlist",

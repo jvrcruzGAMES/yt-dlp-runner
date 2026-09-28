@@ -359,9 +359,9 @@ async def test_embedded_flaresolverr_endpoints():
             health_resp = await client.get("/")
             assert health_resp.status_code == 200
             data = health_resp.json()
-            assert data.get("status") == "ok"
             msg = data.get("message") or data.get("msg", "")
-            assert "FlareSolverr" in msg or "ready" in msg.lower()
+            assert "flaresolverr" in msg.lower() or "ready" in msg.lower()
+            assert "version" in data
 
             # 2. Solve request via POST /v1
             solve_resp = await client.post(

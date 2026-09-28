@@ -577,6 +577,7 @@ class EmbeddedFlareSolverr:
             if path in ["/", "/health"]:
                 response_data = {
                     "status": "ok",
+                    "msg": "FlareSolverr is ready!",
                     "message": "FlareSolverr is ready.",
                     "version": "v3.3.21",
                 }
@@ -590,6 +591,7 @@ class EmbeddedFlareSolverr:
                 else:
                     response_data = {
                         "status": "ok",
+                        "msg": "FlareSolverr is ready!",
                         "message": "FlareSolverr is ready.",
                         "version": "v3.3.21",
                     }

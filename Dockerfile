@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DENO_INSTALL=/usr/local \
     PATH="/usr/local/bin:${PATH}"
 
-# Install ffmpeg, curl, unzip, git, ca-certificates, chromium, and xvfb for FlareSolverr browser automation
+# Install ffmpeg, curl, unzip, git, ca-certificates, chromium, xvfb, and nodejs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
@@ -19,11 +19,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
     xvfb \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno JavaScript runtime
 RUN curl -fsSL https://deno.land/install.sh | sh \
     && deno --version
+
+# Clone and build official Brainicism/bgutil-ytdlp-pot-provider server natively
+RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-provider \
+    && cd /app/bgutil-provider/server \
+    && npm install \
+    && npx tsc
 
 # Create isolated cookies and visible downloads directories
 RUN mkdir -p /app/downloads /app/cookies

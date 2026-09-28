@@ -6,65 +6,122 @@ from pathlib import Path
 import secrets
 import shutil
 import urllib.parse
-from typing import Optional
+from typing import List, Optional
 
 logger = logging.getLogger("yt_dlp_runner.embedded_pot")
 
 DEFAULT_POT_PORT = 4416
 
+OFFICIAL_BGUTIL_PATHS = [
+    "/app/bgutil-provider/server/build/main.js",
+    "/app/bgutil-provider/server/dist/main.js",
+    "/app/bgutil-provider/server/build/server.js",
+    "/app/bgutil-provider/server/main.js",
+]
+
 
 class EmbeddedPotProvider:
     """
-    Faithful recreation of https://github.com/Brainicism/bgutil-ytdlp-pot-provider (server).
-    Provides YouTube Proof-of-Origin (PO) tokens to yt-dlp to bypass bot detection.
-    Listens on 127.0.0.1:4416.
+    Embedded YouTube Proof-of-Origin (POT) Token Provider.
+    Runs the official server from https://github.com/Brainicism/bgutil-ytdlp-pot-provider natively.
     
-    If Deno is installed on the system (e.g. inside Docker container), it executes the
-    Deno server script (`app/bgutil/server.js`). Otherwise, it runs an asynchronous Python HTTP
-    server implementing the exact same bgutil-ytdlp-pot-provider v2.0.0 protocol.
+    When running inside the container, it executes the official Node.js / Deno server
+    built from the official Brainicism/bgutil-ytdlp-pot-provider repository.
+    Includes a fallback asynchronous server for testing and local environments.
     """
     def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_POT_PORT):
         self.host = host
         self.port = port
+        self._node_process: Optional[asyncio.subprocess.Process] = None
         self._python_server: Optional[asyncio.Server] = None
-        self._deno_process: Optional[asyncio.subprocess.Process] = None
         self._running = False
+        self._node_bin = shutil.which("node") or shutil.which("nodejs") or ("/usr/bin/node" if os.path.exists("/usr/bin/node") else None)
         self._deno_bin = shutil.which("deno") or ("/usr/local/bin/deno" if os.path.exists("/usr/local/bin/deno") else None)
-        self._server_script = Path(__file__).parent / "bgutil" / "server.js"
+
+    def _find_official_server_script(self) -> Optional[str]:
+        # 1. Check standard container build paths
+        for p in OFFICIAL_BGUTIL_PATHS:
+            if os.path.exists(p):
+                return p
+
+        # 2. Check relative paths in workspace
+        current_dir = Path(__file__).parent.parent
+        possible_local_paths = [
+            current_dir / "bgutil-provider" / "server" / "build" / "main.js",
+            current_dir.parent.parent / "bgutil-provider" / "server" / "build" / "main.js",
+            current_dir / "app" / "bgutil" / "server.js",
+        ]
+        for p in possible_local_paths:
+            if p.exists():
+                return str(p)
+
+        return None
 
     async def start(self):
         if self._running:
             return
 
-        # 1. Attempt to launch Deno server script if Deno is available
-        if self._deno_bin and self._server_script.exists():
-            try:
-                env = os.environ.copy()
-                env["POT_PORT"] = str(self.port)
-                env["POT_HOST"] = self.host
-                self._deno_process = await asyncio.create_subprocess_exec(
-                    self._deno_bin,
-                    "run",
-                    "--allow-net",
-                    "--allow-env",
-                    str(self._server_script),
-                    env=env,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                )
-                self._running = True
-                logger.info(f"Embedded bgutil POT provider (Deno backend) active at http://{self.host}:{self.port}")
-                return
-            except Exception as e:
-                logger.warning(f"Could not launch Deno POT server: {e}. Falling back to Python server.")
+        server_script = self._find_official_server_script()
 
-        # 2. Asynchronous Python server implementing identical bgutil protocol
+        # 1. Attempt to launch official Node.js / Deno server script
+        if server_script:
+            env = os.environ.copy()
+            env["PORT"] = str(self.port)
+            env["HOST"] = self.host
+            env["POT_PORT"] = str(self.port)
+            env["POT_HOST"] = self.host
+
+            if self._node_bin and server_script.endswith(".js"):
+                try:
+                    logger.info(f"Launching official bgutil POT provider with Node.js: {server_script} on port {self.port}...")
+                    self._node_process = await asyncio.create_subprocess_exec(
+                        self._node_bin,
+                        server_script,
+                        env=env,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.sleep(0.2)
+                    if self._node_process.returncode is None:
+                        self._running = True
+                        logger.info(f"Official bgutil POT provider (Node.js) active at http://{self.host}:{self.port}")
+                        return
+                    else:
+                        logger.warning("Node.js process exited immediately. Trying fallback...")
+                except Exception as e:
+                    logger.warning(f"Failed to launch Node.js bgutil server ({e}). Trying fallback...")
+
+            if self._deno_bin:
+                try:
+                    logger.info(f"Launching official bgutil POT provider with Deno: {server_script} on port {self.port}...")
+                    self._node_process = await asyncio.create_subprocess_exec(
+                        self._deno_bin,
+                        "run",
+                        "--allow-net",
+                        "--allow-env",
+                        "--allow-read",
+                        server_script,
+                        env=env,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.sleep(0.2)
+                    if self._node_process.returncode is None:
+                        self._running = True
+                        logger.info(f"Official bgutil POT provider (Deno) active at http://{self.host}:{self.port}")
+                        return
+                    else:
+                        logger.warning("Deno process exited immediately. Trying fallback...")
+                except Exception as e:
+                    logger.warning(f"Failed to launch Deno bgutil server ({e}). Trying fallback...")
+
+        # 2. Python fallback server for environments without Node/built script
         try:
             self._python_server = await asyncio.start_server(
                 self._handle_client, self.host, self.port
             )
             self._running = True
-            logger.info(f"Embedded bgutil POT provider (Python backend) active at http://{self.host}:{self.port}")
+            logger.info(f"Embedded bgutil POT provider (Python runtime) active at http://{self.host}:{self.port}")
         except Exception as e:
             logger.warning(f"Could not start Python POT provider on {self.host}:{self.port}: {e}")
 
@@ -72,13 +129,13 @@ class EmbeddedPotProvider:
         if not self._running:
             return
 
-        if self._deno_process:
+        if self._node_process:
             try:
-                self._deno_process.terminate()
-                await self._deno_process.wait()
+                self._node_process.terminate()
+                await self._node_process.wait()
             except Exception:
                 pass
-            self._deno_process = None
+            self._node_process = None
 
         if self._python_server:
             self._python_server.close()
@@ -93,7 +150,7 @@ class EmbeddedPotProvider:
 
     @property
     def is_active(self) -> bool:
-        return self._running and (self._python_server is not None or self._deno_process is not None)
+        return self._running and (self._node_process is not None or self._python_server is not None)
 
     def _generate_pot_token(self, client_name: str, visitor_data: str) -> str:
         chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -121,7 +178,6 @@ class EmbeddedPotProvider:
             method = parts[0].upper()
             path_and_query = parts[1]
 
-            # Read headers
             content_length = 0
             headers = {}
             while True:
@@ -178,7 +234,6 @@ class EmbeddedPotProvider:
                     or query_params.get("dataSyncId", [""])[0]
                 )
 
-                # Parse JSON request body if present
                 if body:
                     try:
                         req_json = json.loads(body.decode("utf-8"))
@@ -200,7 +255,6 @@ class EmbeddedPotProvider:
 
                 pot_token = self._generate_pot_token(client_name, visitor_data)
 
-                # Supply all common response keys across different yt-dlp plugin versions
                 response_data = {
                     "po_token": pot_token,
                     "pot": pot_token,

@@ -36,7 +36,7 @@ jobs:
 
       - name: Run test suite
         run: |
-          pytest tests
+          PYTHONPATH=. pytest tests
 
   build-and-sign:
     needs: test

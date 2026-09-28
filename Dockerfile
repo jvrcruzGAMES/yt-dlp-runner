@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DENO_INSTALL=/usr/local \
     PATH="/usr/local/bin:${PATH}"
 
-# Install ffmpeg, curl, unzip, git, ca-certificates, chromium, xvfb, and nodejs
+# Install ffmpeg, curl, unzip, git, ca-certificates, chromium, xvfb, nodejs, npm and native canvas build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
@@ -21,17 +21,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     nodejs \
     npm \
+    build-essential \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libjpeg-dev \
+    libgif-dev \
+    librsvg2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno JavaScript runtime
 RUN curl -fsSL https://deno.land/install.sh | sh \
     && deno --version
-
-# Clone and build official Brainicism/bgutil-ytdlp-pot-provider server natively
-RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /app/bgutil-provider \
-    && cd /app/bgutil-provider/server \
-    && npm install \
-    && npx tsc
 
 # Create isolated cookies and visible downloads directories
 RUN mkdir -p /app/downloads /app/cookies
@@ -40,6 +40,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# Build official Brainicism/bgutil-ytdlp-pot-provider server natively according to README
+RUN cd /app/app/bgutil \
+    && npm install \
+    && npx tsc
 
 EXPOSE 8080
 

@@ -13,10 +13,10 @@ logger = logging.getLogger("yt_dlp_runner.embedded_pot")
 DEFAULT_POT_PORT = 4416
 
 OFFICIAL_BGUTIL_PATHS = [
+    "/app/app/bgutil/build/main.js",
     "/app/bgutil-provider/server/build/main.js",
-    "/app/bgutil-provider/server/dist/main.js",
-    "/app/bgutil-provider/server/build/server.js",
-    "/app/bgutil-provider/server/main.js",
+    "/app/app/bgutil/src/main.ts",
+    "/app/bgutil-provider/server/src/main.ts",
 ]
 
 
@@ -47,9 +47,10 @@ class EmbeddedPotProvider:
         # 2. Check relative paths in workspace
         current_dir = Path(__file__).parent.parent
         possible_local_paths = [
+            Path(__file__).parent / "bgutil" / "build" / "main.js",
+            Path(__file__).parent / "bgutil" / "src" / "main.ts",
             current_dir / "bgutil-provider" / "server" / "build" / "main.js",
             current_dir.parent.parent / "bgutil-provider" / "server" / "build" / "main.js",
-            current_dir / "app" / "bgutil" / "server.js",
         ]
         for p in possible_local_paths:
             if p.exists():
@@ -66,22 +67,25 @@ class EmbeddedPotProvider:
         # 1. Attempt to launch official Node.js / Deno server script
         if server_script:
             env = os.environ.copy()
-            env["PORT"] = str(self.port)
-            env["HOST"] = self.host
-            env["POT_PORT"] = str(self.port)
-            env["POT_HOST"] = self.host
+            script_path = Path(server_script).resolve()
+            bgutil_dir = script_path.parent.parent if script_path.parent.name in ["build", "src"] else script_path.parent
 
             if self._node_bin and server_script.endswith(".js"):
                 try:
-                    logger.info(f"Launching official bgutil POT provider with Node.js: {server_script} on port {self.port}...")
+                    logger.info(f"Launching official bgutil POT provider with Node.js: {server_script} -p {self.port} -H {self.host}...")
                     self._node_process = await asyncio.create_subprocess_exec(
                         self._node_bin,
-                        server_script,
+                        str(script_path),
+                        "-p",
+                        str(self.port),
+                        "-H",
+                        self.host,
                         env=env,
+                        cwd=str(bgutil_dir),
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.3)
                     if self._node_process.returncode is None:
                         self._running = True
                         logger.info(f"Official bgutil POT provider (Node.js) active at http://{self.host}:{self.port}")
@@ -93,19 +97,33 @@ class EmbeddedPotProvider:
 
             if self._deno_bin:
                 try:
-                    logger.info(f"Launching official bgutil POT provider with Deno: {server_script} on port {self.port}...")
-                    self._node_process = await asyncio.create_subprocess_exec(
+                    logger.info(f"Launching official bgutil POT provider with Deno: {server_script} -p {self.port} -H {self.host}...")
+                    node_modules = bgutil_dir / "node_modules"
+                    deno_args = [
                         self._deno_bin,
                         "run",
                         "--allow-net",
                         "--allow-env",
-                        "--allow-read",
-                        server_script,
+                    ]
+                    if node_modules.exists():
+                        deno_args.extend([f"--allow-ffi={node_modules}", f"--allow-read={node_modules}"])
+                    else:
+                        deno_args.append("--allow-read")
+                    deno_args.extend([
+                        str(script_path),
+                        "-p",
+                        str(self.port),
+                        "-H",
+                        self.host,
+                    ])
+                    self._node_process = await asyncio.create_subprocess_exec(
+                        *deno_args,
                         env=env,
+                        cwd=str(bgutil_dir),
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.3)
                     if self._node_process.returncode is None:
                         self._running = True
                         logger.info(f"Official bgutil POT provider (Deno) active at http://{self.host}:{self.port}")

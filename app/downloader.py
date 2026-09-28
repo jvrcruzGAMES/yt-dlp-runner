@@ -183,6 +183,8 @@ def build_yt_dlp_command(
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-check-certificates",
+        "--no-interactive",
+        "--force-overwrites",
         "--newline",
         "--no-playlist",
         "--no-mtime",
@@ -190,6 +192,12 @@ def build_yt_dlp_command(
         "--paths", f"home:{abs_downloads}",
         "--paths", f"temp:{abs_downloads}",
     ]
+
+    # Use available JS runtime (Node / Deno) for YouTube extraction
+    if shutil.which("node") or os.path.exists("/usr/bin/node"):
+        cmd.extend(["--js-runtimes", "node"])
+    elif shutil.which("deno") or os.path.exists("/usr/local/bin/deno"):
+        cmd.extend(["--js-runtimes", "deno"])
 
     output_template = request.output_template or "%(title)s [%(id)s].%(ext)s"
     cmd.extend(["-o", output_template])
@@ -199,9 +207,6 @@ def build_yt_dlp_command(
 
     if cookie_path and os.path.exists(cookie_path):
         cmd.extend(["--cookies", cookie_path])
-
-    if flaresolverr_proxy.is_active:
-        cmd.extend(["--proxy", flaresolverr_proxy.proxy_url])
 
     pot_url = (
         getattr(settings, "BGUTIL_POT_PROVIDER_URL", None)
@@ -319,20 +324,17 @@ class DownloadTaskManager:
         try:
             self.touch_activity()
 
-            # 0. Ensure yt-dlp and any client-requested plugins are installed via pip
-            packages_to_install = ["yt-dlp"]
+            # 0. Ensure client-requested plugins are installed via pip if specified
             if request.plugins:
-                packages_to_install.extend(request.plugins)
-
-            task.status = "installing_plugins"
-            task.logs.append(f"Installing/verifying packages via pip: {packages_to_install}")
-            plugin_resp = await plugin_manager.install_plugins(
-                PluginInstallRequest(packages=packages_to_install, upgrade=True)
-            )
-            if plugin_resp.success:
-                task.logs.append(f"Successfully installed/verified packages: {packages_to_install}")
-            else:
-                task.logs.append(f"Package install output/warning: {plugin_resp.stderr or plugin_resp.stdout}")
+                task.status = "installing_plugins"
+                task.logs.append(f"Installing plugins via pip: {request.plugins}")
+                plugin_resp = await plugin_manager.install_plugins(
+                    PluginInstallRequest(packages=request.plugins, upgrade=False)
+                )
+                if plugin_resp.success:
+                    task.logs.append(f"Successfully installed plugins: {request.plugins}")
+                else:
+                    task.logs.append(f"Plugin install warning: {plugin_resp.stderr or plugin_resp.stdout}")
 
             task.status = "downloading"
             task.logs.append(f"Starting yt-dlp CLI download for URL: {request.url}")
@@ -351,9 +353,10 @@ class DownloadTaskManager:
                 task.logs.append(f"Stripped worker-reserved arguments: {stripped_args}")
             task.logs.append(f"Executing CLI command: {' '.join(cmd)}")
 
-            # 3. Spawn subprocess and read stdout/stderr in real-time
+            # 3. Spawn subprocess with DEVNULL stdin to prevent hanging
             process = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(downloads_dir.resolve()),
@@ -425,45 +428,13 @@ class DownloadTaskManager:
                     if ep not in candidate_paths:
                         candidate_paths.append(ep)
 
-            # Search downloads_dir and cwd
-            search_dirs = [downloads_dir]
-            if cwd_dir != downloads_dir.resolve() and cwd_dir.exists():
-                search_dirs.append(cwd_dir)
-
-            for sdir in search_dirs:
-                for f in sdir.rglob("*"):
+            # Search downloads_dir
+            if downloads_dir.exists():
+                for f in downloads_dir.rglob("*"):
                     if not f.is_file() or f.suffix.lower() in TEMP_EXTENSIONS:
                         continue
-                    if sdir == cwd_dir and sdir != downloads_dir.resolve():
-                        if f.suffix.lower() in {".py", ".pyc", ".txt", ".md", ".yml", ".yaml", ".ini", ".sh"}:
-                            continue
-                        if any(part in str(f) for part in ["site-packages", ".git", "__pycache__", "tests", "app"]):
-                            continue
-
-                    try:
-                        st = f.stat()
-                        mtime = st.st_mtime
-                        size = st.st_size
-                        resolved = f.resolve()
-
-                        if (
-                            resolved not in before_files
-                            or before_files.get(resolved) != (mtime, size)
-                            or mtime >= (start_timestamp - 5.0)
-                        ):
-                            # If file dropped into cwd, move it to downloads_dir
-                            if sdir == cwd_dir and sdir != downloads_dir.resolve():
-                                target_dest = downloads_dir / f.name
-                                try:
-                                    shutil.move(str(f), str(target_dest))
-                                    f = target_dest
-                                except Exception as mv_err:
-                                    logger.warning(f"Could not move file {f} to {downloads_dir}: {mv_err}")
-
-                            if f not in candidate_paths:
-                                candidate_paths.append(f)
-                    except OSError:
-                        continue
+                    if f not in candidate_paths:
+                        candidate_paths.append(f)
 
             # Prioritize media files, then sort by file size descending
             def sort_key(p: Path):
@@ -495,6 +466,13 @@ class DownloadTaskManager:
                 task.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 file_names = [f.filename for f in discovered_files]
                 task.logs.append(f"Task completed successfully. Generated {len(discovered_files)} file(s): {file_names}")
+                self.total_completed_downloads += 1
+                self.touch_activity()
+            elif return_code == 0:
+                task.status = "completed"
+                task.progress_percent = 100.0
+                task.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                task.logs.append("Task completed successfully.")
                 self.total_completed_downloads += 1
                 self.touch_activity()
             else:

@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import shutil
+import sys
 import time
 import urllib.parse
 from typing import Dict, List, Optional
@@ -10,6 +12,11 @@ from typing import Dict, List, Optional
 logger = logging.getLogger("yt_dlp_runner.embedded_flaresolverr")
 
 DEFAULT_FLARESOLVERR_PORT = 8191
+
+OFFICIAL_FLARESOLVERR_PATHS = [
+    "/app/app/flaresolverr/src/flaresolverr.py",
+    "/app/flaresolverr/src/flaresolverr.py",
+]
 
 CLOUDFLARE_CHALLENGE_TITLES = [
     "Just a moment...",
@@ -50,61 +57,125 @@ class FlareSolverrSession:
 
 class EmbeddedFlareSolverr:
     """
-    Embedded FlareSolverr Service powered by undetected-chromedriver & Selenium.
-    Matches the official FlareSolverr backend (https://github.com/Flaresolverr/Flaresolverr):
-    - Uses undetected-chromedriver to control a headless Chromium browser instance
-    - Detects and waits for Cloudflare Turnstile, IUAM, and Bot Management challenges to solve
-    - Extracts full cookie jars (including cf_clearance), userAgent, and resolved HTML
-    - Manages persistent browser sessions across multiple requests
-    - Fallback support for headless environments via curl_cffi TLS impersonation
+    Embedded FlareSolverr Service powered by the official FlareSolverr source code
+    (https://github.com/Flaresolverr/Flaresolverr).
+
+    When running inside the container or when dependencies are present, it executes
+    the official FlareSolverr server natively from source (python src/flaresolverr.py).
+    Includes a built-in asynchronous fallback solver for headless unit test suites.
     """
     def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_FLARESOLVERR_PORT):
         self.host = host
         self.port = port
         self.server: Optional[asyncio.Server] = None
+        self._process: Optional[asyncio.subprocess.Process] = None
         self._running = False
         self._sessions: Dict[str, FlareSolverrSession] = {}
         self._default_driver = None
+
+    def _find_official_flaresolverr_script(self) -> Optional[str]:
+        # 1. Check standard container paths
+        for p in OFFICIAL_FLARESOLVERR_PATHS:
+            if os.path.exists(p):
+                return p
+
+        # 2. Check local relative paths
+        local_candidates = [
+            Path(__file__).parent / "flaresolverr" / "src" / "flaresolverr.py",
+            Path(__file__).parent.parent / "flaresolverr" / "src" / "flaresolverr.py",
+            Path(__file__).parent.parent.parent / "flaresolverr" / "src" / "flaresolverr.py",
+        ]
+        for p in local_candidates:
+            if p.exists():
+                return str(p)
+
+        return None
 
     async def start(self):
         if self._running:
             return
 
+        script_path = self._find_official_flaresolverr_script()
+
+        # 1. Attempt to launch official FlareSolverr from source code
+        if script_path:
+            resolved_script = Path(script_path).resolve()
+            src_dir = resolved_script.parent
+            env = os.environ.copy()
+            env["HOST"] = self.host
+            env["PORT"] = str(self.port)
+            env["LOG_LEVEL"] = env.get("LOG_LEVEL", "info")
+            env["HEADLESS"] = env.get("HEADLESS", "true")
+
+            try:
+                logger.info(f"Launching official FlareSolverr from source: {resolved_script} on {self.host}:{self.port}...")
+                self._process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    str(resolved_script),
+                    env=env,
+                    cwd=str(src_dir),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.sleep(0.5)
+                if self._process.returncode is None:
+                    self._running = True
+                    logger.info(f"Official FlareSolverr (from source) active at http://{self.host}:{self.port}/v1")
+                    return
+                else:
+                    logger.warning(f"Official FlareSolverr process exited (code {self._process.returncode}). Using embedded fallback server...")
+            except Exception as e:
+                logger.warning(f"Failed to launch official FlareSolverr process ({e}). Using embedded fallback server...")
+
+        # 2. Asynchronous fallback server for testing environments without full browser/Xvfb setup
         try:
             self.server = await asyncio.start_server(
                 self._handle_client, self.host, self.port
             )
             self._running = True
-            logger.info(f"Embedded FlareSolverr active at http://{self.host}:{self.port}/v1 (backend: undetected-chromedriver)")
+            logger.info(f"Embedded FlareSolverr active at http://{self.host}:{self.port}/v1 (backend: undetected-chromedriver / fallback)")
         except Exception as e:
             logger.warning(f"Could not start embedded FlareSolverr on {self.host}:{self.port}: {e}")
 
     async def stop(self):
-        if self.server and self._running:
+        if not self._running:
+            return
+
+        if self._process:
+            try:
+                self._process.terminate()
+                await self._process.wait()
+            except Exception:
+                pass
+            self._process = None
+
+        if self.server:
             self.server.close()
             try:
                 await self.server.wait_closed()
             except Exception:
                 pass
-            self._running = False
+            self.server = None
 
-            # Clean up all active browser instances
-            for sess in self._sessions.values():
-                sess.close()
-            self._sessions.clear()
+        self._running = False
 
-            if self._default_driver:
-                try:
-                    self._default_driver.quit()
-                except Exception:
-                    pass
-                self._default_driver = None
+        # Clean up all active browser instances
+        for sess in self._sessions.values():
+            sess.close()
+        self._sessions.clear()
 
-            logger.info("Embedded FlareSolverr stopped.")
+        if self._default_driver:
+            try:
+                self._default_driver.quit()
+            except Exception:
+                pass
+            self._default_driver = None
+
+        logger.info("Embedded FlareSolverr stopped.")
 
     @property
     def is_active(self) -> bool:
-        return self._running and self.server is not None
+        return self._running and (self._process is not None or self.server is not None)
 
     def _create_uc_driver(self, proxy: Optional[str] = None):
         """

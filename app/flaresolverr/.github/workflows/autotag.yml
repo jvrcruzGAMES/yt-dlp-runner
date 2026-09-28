@@ -1,0 +1,19 @@
+name: Autotag
+
+on:
+  push:
+    branches:
+      - "master"
+
+jobs:
+  tag-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Auto tag
+        uses: Klemensas/action-autotag@stable
+        with:
+          GITHUB_TOKEN: "${{ secrets.GH_PAT }}"
+          tag_prefix: "v"

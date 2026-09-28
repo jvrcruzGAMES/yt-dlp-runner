@@ -286,29 +286,44 @@ class EmbeddedFlareSolverr:
             driver_created_here = False
 
             if not driver:
-                driver = await loop.run_in_executor(None, self._create_uc_driver, proxy)
-                driver_created_here = True
+                try:
+                    driver = await asyncio.wait_for(
+                        loop.run_in_executor(None, self._create_uc_driver, proxy),
+                        timeout=5.0,
+                    )
+                    driver_created_here = True
+                except Exception as e:
+                    logger.debug(f"undetected-chromedriver creation timed out or failed: {e}")
+                    driver = None
 
             solution = None
             if driver:
-                solution = await loop.run_in_executor(
-                    None,
-                    self._solve_with_uc_driver,
-                    driver,
-                    target_url,
-                    cmd,
-                    max_timeout,
-                    cookies_param,
-                    headers_param,
-                    post_data,
-                )
-                if driver_created_here and not active_session:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
+                try:
+                    solution = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            self._solve_with_uc_driver,
+                            driver,
+                            target_url,
+                            cmd,
+                            max_timeout,
+                            cookies_param,
+                            headers_param,
+                            post_data,
+                        ),
+                        timeout=max_timeout + 5.0,
+                    )
+                except Exception as e:
+                    logger.debug(f"undetected-chromedriver solve timed out or failed: {e}")
+                    solution = None
+                finally:
+                    if driver_created_here and not active_session:
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
 
-            # Attempt 2: Fallback to curl_cffi with Chrome TLS impersonation if driver unavailable
+            # Attempt 2: Fallback to curl_cffi / httpx with Chrome TLS impersonation if driver unavailable
             if not solution:
                 try:
                     from curl_cffi.requests import AsyncSession
@@ -355,7 +370,27 @@ class EmbeddedFlareSolverr:
                             "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                         }
                 except Exception as exc:
-                    logger.warning(f"curl_cffi fallback error: {exc}")
+                    logger.debug(f"curl_cffi fallback error: {exc}. Attempting standard httpx client...")
+                    try:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=max_timeout, verify=False) as h_client:
+                            if cmd == "request.post":
+                                resp = await h_client.post(target_url, headers=headers_param, content=post_data)
+                            else:
+                                resp = await h_client.get(target_url, headers=headers_param)
+
+                            parsed_domain = urllib.parse.urlparse(target_url).hostname or ""
+                            cookies_list = [{"name": k, "value": v, "domain": parsed_domain, "path": "/"} for k, v in resp.cookies.items()]
+                            solution = {
+                                "url": str(resp.url),
+                                "status": resp.status_code,
+                                "headers": dict(resp.headers),
+                                "response": resp.text,
+                                "cookies": cookies_list,
+                                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                            }
+                    except Exception as e2:
+                        logger.warning(f"FlareSolverr resolution error: {e2}")
 
             if solution:
                 end_ts = int(time.time() * 1000)

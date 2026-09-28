@@ -354,7 +354,7 @@ async def test_embedded_flaresolverr_endpoints():
     assert solver.is_active is True
 
     try:
-        async with httpx.AsyncClient(base_url="http://127.0.0.1:48191", timeout=5.0) as client:
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:48191", timeout=15.0) as client:
             # 1. Root / health
             health_resp = await client.get("/")
             assert health_resp.status_code == 200

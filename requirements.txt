@@ -11,3 +11,5 @@ yt-dlp-ejs>=0.8.0
 curl_cffi>=0.7.0
 mitmproxy>=10.0.0
 requests>=2.31.0
+undetected-chromedriver>=3.5.5
+selenium>=4.18.0

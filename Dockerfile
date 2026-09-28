@@ -9,13 +9,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DENO_INSTALL=/usr/local \
     PATH="/usr/local/bin:${PATH}"
 
-# Install ffmpeg, curl, unzip, git, and ca-certificates
+# Install ffmpeg, curl, unzip, git, ca-certificates, chromium, and xvfb for FlareSolverr browser automation
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     unzip \
     git \
     ca-certificates \
+    chromium \
+    chromium-driver \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno JavaScript runtime

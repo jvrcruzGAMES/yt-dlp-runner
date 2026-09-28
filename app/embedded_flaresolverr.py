@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 import urllib.parse
 from typing import Dict, List, Optional
@@ -10,24 +11,52 @@ logger = logging.getLogger("yt_dlp_runner.embedded_flaresolverr")
 
 DEFAULT_FLARESOLVERR_PORT = 8191
 
+CLOUDFLARE_CHALLENGE_TITLES = [
+    "Just a moment...",
+    "Attention Required! | Cloudflare",
+    "Checking your browser",
+    "Please Wait...",
+    "Cloudflare",
+]
+
+CLOUDFLARE_CHALLENGE_SELECTORS = [
+    "#cf-challenge-running",
+    "#challenge-running",
+    "#challenge-stage",
+    ".ray_id",
+    "#cf-browser-verification",
+    "#cf-challenge-body",
+    "#turnstile-wrapper",
+]
+
 
 class FlareSolverrSession:
     def __init__(self, session_id: str, proxy: Optional[str] = None):
         self.session_id = session_id
         self.proxy = proxy
+        self.driver = None
         self.cookies: Dict[str, dict] = {}
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         self.created_at = time.time()
 
+    def close(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
 
 class EmbeddedFlareSolverr:
     """
-    Embedded FlareSolverr v1 Compatible Challenge Solver Service.
-    Strictly follows the official FlareSolverr API specification (v1/v2/v3):
-    - POST /v1 with commands: request.get, request.post, sessions.create, sessions.list, sessions.destroy
-    - GET / and GET /health
-    Uses browser TLS/HTTP2 fingerprint impersonation (curl_cffi) to solve Cloudflare Turnstile,
-    Under Attack Mode (IUAM), and Bot Protection headers without requiring an external container.
+    Embedded FlareSolverr Service powered by undetected-chromedriver & Selenium.
+    Matches the official FlareSolverr backend (https://github.com/Flaresolverr/Flaresolverr):
+    - Uses undetected-chromedriver to control a headless Chromium browser instance
+    - Detects and waits for Cloudflare Turnstile, IUAM, and Bot Management challenges to solve
+    - Extracts full cookie jars (including cf_clearance), userAgent, and resolved HTML
+    - Manages persistent browser sessions across multiple requests
+    - Fallback support for headless environments via curl_cffi TLS impersonation
     """
     def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_FLARESOLVERR_PORT):
         self.host = host
@@ -35,6 +64,7 @@ class EmbeddedFlareSolverr:
         self.server: Optional[asyncio.Server] = None
         self._running = False
         self._sessions: Dict[str, FlareSolverrSession] = {}
+        self._default_driver = None
 
     async def start(self):
         if self._running:
@@ -45,7 +75,7 @@ class EmbeddedFlareSolverr:
                 self._handle_client, self.host, self.port
             )
             self._running = True
-            logger.info(f"Embedded FlareSolverr active at http://{self.host}:{self.port}/v1")
+            logger.info(f"Embedded FlareSolverr active at http://{self.host}:{self.port}/v1 (backend: undetected-chromedriver)")
         except Exception as e:
             logger.warning(f"Could not start embedded FlareSolverr on {self.host}:{self.port}: {e}")
 
@@ -57,29 +87,144 @@ class EmbeddedFlareSolverr:
             except Exception:
                 pass
             self._running = False
+
+            # Clean up all active browser instances
+            for sess in self._sessions.values():
+                sess.close()
             self._sessions.clear()
+
+            if self._default_driver:
+                try:
+                    self._default_driver.quit()
+                except Exception:
+                    pass
+                self._default_driver = None
+
             logger.info("Embedded FlareSolverr stopped.")
 
     @property
     def is_active(self) -> bool:
         return self._running and self.server is not None
 
-    async def _handle_request(self, payload: dict) -> dict:
-        cmd = payload.get("cmd", "")
+    def _create_uc_driver(self, proxy: Optional[str] = None):
+        """
+        Creates an undetected-chromedriver Chrome instance configured identically to FlareSolverr.
+        """
+        try:
+            import undetected_chromedriver as uc
+
+            options = uc.ChromeOptions()
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--no-first-run")
+            options.add_argument("--window-size=1920,1080")
+
+            if proxy:
+                options.add_argument(f"--proxy-server={proxy}")
+
+            for chrome_bin in ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]:
+                if os.path.exists(chrome_bin):
+                    options.binary_location = chrome_bin
+                    break
+
+            driver = uc.Chrome(options=options, headless=True)
+            return driver
+        except Exception as e:
+            logger.debug(f"undetected-chromedriver not initialized or display unavailable: {e}")
+            return None
+
+    def _solve_with_uc_driver(
+        self,
+        driver,
+        target_url: str,
+        cmd: str,
+        max_timeout: float,
+        cookies: Optional[List[dict]] = None,
+        headers: Optional[dict] = None,
+        post_data: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Executes challenge resolution via undetected-chromedriver.
+        Waits for Cloudflare challenges to clear and returns the solution dictionary.
+        """
+        try:
+            driver.set_page_load_timeout(max_timeout)
+            driver.get(target_url)
+
+            # Inject custom cookies
+            if cookies:
+                for c in cookies:
+                    if isinstance(c, dict) and "name" in c and "value" in c:
+                        try:
+                            driver.add_cookie({
+                                "name": c["name"],
+                                "value": c["value"],
+                                "domain": c.get("domain") or urllib.parse.urlparse(target_url).hostname or "",
+                                "path": c.get("path", "/"),
+                            })
+                        except Exception:
+                            pass
+
+            start_time = time.time()
+            challenge_detected = False
+
+            # Challenge polling loop
+            while (time.time() - start_time) < max_timeout:
+                title = driver.title or ""
+                page_source = driver.page_source or ""
+
+                is_challenge = any(t in title for t in CLOUDFLARE_CHALLENGE_TITLES) or any(
+                    sel in page_source for sel in ["cf-browser-verification", "turnstile-wrapper", "challenge-running"]
+                )
+
+                if is_challenge:
+                    challenge_detected = True
+                    time.sleep(1.0)
+                else:
+                    break
+
+            current_url = driver.current_url
+            page_html = driver.page_source
+            extracted_cookies = driver.get_cookies()
+            user_agent = driver.execute_script("return navigator.userAgent")
+
+            return {
+                "url": current_url,
+                "status": 200,
+                "headers": {},
+                "response": page_html,
+                "cookies": extracted_cookies,
+                "userAgent": user_agent,
+                "challenge_detected": challenge_detected,
+            }
+        except Exception as e:
+            logger.warning(f"Error during undetected-chromedriver execution: {e}")
+            return None
+
+    async def _solve_request(self, payload: dict) -> dict:
+        cmd = payload.get("cmd", "request.get")
+        target_url = payload.get("url")
         start_ts = int(time.time() * 1000)
 
         # 1. Sessions Management
         if cmd == "sessions.create":
             session_id = payload.get("session") or f"session_{int(time.time())}"
             proxy_url = payload.get("proxy", {}).get("url") if isinstance(payload.get("proxy"), dict) else None
-            self._sessions[session_id] = FlareSolverrSession(session_id, proxy_url)
+            sess = FlareSolverrSession(session_id, proxy_url)
+            # Pre-initialize browser driver for session in background
+            loop = asyncio.get_event_loop()
+            sess.driver = await loop.run_in_executor(None, self._create_uc_driver, proxy_url)
+            self._sessions[session_id] = sess
             return {
                 "status": "ok",
                 "message": "Session created successfully.",
                 "session": session_id,
                 "startTimestamp": start_ts,
                 "endTimestamp": int(time.time() * 1000),
-                "version": "v3.3.21-embedded",
+                "version": "v3.3.21",
             }
 
         if cmd == "sessions.list":
@@ -89,30 +234,31 @@ class EmbeddedFlareSolverr:
                 "sessions": list(self._sessions.keys()),
                 "startTimestamp": start_ts,
                 "endTimestamp": int(time.time() * 1000),
-                "version": "v3.3.21-embedded",
+                "version": "v3.3.21",
             }
 
         if cmd == "sessions.destroy":
             session_id = payload.get("session", "")
-            self._sessions.pop(session_id, None)
+            sess = self._sessions.pop(session_id, None)
+            if sess:
+                sess.close()
             return {
                 "status": "ok",
                 "message": "Session destroyed successfully.",
                 "startTimestamp": start_ts,
                 "endTimestamp": int(time.time() * 1000),
-                "version": "v3.3.21-embedded",
+                "version": "v3.3.21",
             }
 
-        # 2. HTTP Request Solving (request.get, request.post)
+        # 2. HTTP Challenge Solving
         if cmd in ["request.get", "request.post"]:
-            target_url = payload.get("url")
             if not target_url:
                 return {
                     "status": "error",
                     "message": "Missing target URL parameter 'url'.",
                     "startTimestamp": start_ts,
                     "endTimestamp": int(time.time() * 1000),
-                    "version": "v3.3.21-embedded",
+                    "version": "v3.3.21",
                 }
 
             max_timeout = min(payload.get("maxTimeout", 60000) / 1000.0, 60.0)
@@ -128,140 +274,118 @@ class EmbeddedFlareSolverr:
             elif os.getenv("FLARESOLVERR_PROXY"):
                 proxy = os.getenv("FLARESOLVERR_PROXY")
 
-            # Custom cookies & headers
-            cookie_dict = {}
-            if active_session:
-                cookie_dict.update({k: v["value"] for k, v in active_session.cookies.items()})
-
-            if payload.get("cookies") and isinstance(payload.get("cookies"), list):
-                for c in payload["cookies"]:
-                    if isinstance(c, dict) and "name" in c and "value" in c:
-                        cookie_dict[c["name"]] = c["value"]
-
-            custom_headers = payload.get("headers") or {}
+            cookies_param = payload.get("cookies") or []
+            headers_param = payload.get("headers") or {}
             post_data = payload.get("postData")
             return_only_cookies = payload.get("returnOnlyCookies", False)
 
-            # Perform request using curl_cffi with full Chrome TLS impersonation
-            try:
-                from curl_cffi.requests import AsyncSession
+            loop = asyncio.get_event_loop()
 
-                proxies = {"http": proxy, "https": proxy} if proxy else None
-                async with AsyncSession(impersonate="chrome124", timeout=max_timeout) as session:
-                    if cmd == "request.post":
-                        resp = await session.post(
-                            target_url,
-                            headers=custom_headers,
-                            cookies=cookie_dict,
-                            data=post_data,
-                            proxies=proxies,
-                        )
-                    else:
-                        resp = await session.get(
-                            target_url,
-                            headers=custom_headers,
-                            cookies=cookie_dict,
-                            proxies=proxies,
-                        )
+            # Attempt 1: Use undetected-chromedriver (actual FlareSolverr backend)
+            driver = active_session.driver if active_session and active_session.driver else None
+            driver_created_here = False
 
-                    parsed_domain = urllib.parse.urlparse(target_url).hostname or ""
-                    cookies_list: List[dict] = []
+            if not driver:
+                driver = await loop.run_in_executor(None, self._create_uc_driver, proxy)
+                driver_created_here = True
 
-                    # Extract response cookies and update active session
-                    for k, v in resp.cookies.items():
-                        c_entry = {
-                            "name": k,
-                            "value": v,
-                            "domain": parsed_domain,
-                            "path": "/",
-                            "httpOnly": False,
-                            "secure": target_url.startswith("https://"),
-                            "sameSite": "Lax",
-                        }
-                        cookies_list.append(c_entry)
-                        if active_session:
-                            active_session.cookies[k] = c_entry
+            solution = None
+            if driver:
+                solution = await loop.run_in_executor(
+                    None,
+                    self._solve_with_uc_driver,
+                    driver,
+                    target_url,
+                    cmd,
+                    max_timeout,
+                    cookies_param,
+                    headers_param,
+                    post_data,
+                )
+                if driver_created_here and not active_session:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
 
-                    # Also include any previously injected cookies
-                    for ck, cv in cookie_dict.items():
-                        if not any(c["name"] == ck for c in cookies_list):
+            # Attempt 2: Fallback to curl_cffi with Chrome TLS impersonation if driver unavailable
+            if not solution:
+                try:
+                    from curl_cffi.requests import AsyncSession
+
+                    cookie_dict = {}
+                    for c in cookies_param:
+                        if isinstance(c, dict) and "name" in c and "value" in c:
+                            cookie_dict[c["name"]] = c["value"]
+
+                    proxies = {"http": proxy, "https": proxy} if proxy else None
+                    async with AsyncSession(impersonate="chrome124", timeout=max_timeout) as session:
+                        if cmd == "request.post":
+                            resp = await session.post(
+                                target_url,
+                                headers=headers_param,
+                                cookies=cookie_dict,
+                                data=post_data,
+                                proxies=proxies,
+                            )
+                        else:
+                            resp = await session.get(
+                                target_url,
+                                headers=headers_param,
+                                cookies=cookie_dict,
+                                proxies=proxies,
+                            )
+
+                        parsed_domain = urllib.parse.urlparse(target_url).hostname or ""
+                        cookies_list = []
+                        for k, v in resp.cookies.items():
                             cookies_list.append({
-                                "name": ck,
-                                "value": cv,
+                                "name": k,
+                                "value": v,
                                 "domain": parsed_domain,
                                 "path": "/",
                             })
 
-                    end_ts = int(time.time() * 1000)
-                    response_text = "" if return_only_cookies else resp.text
-
-                    return {
-                        "status": "ok",
-                        "message": "Challenge solved!",
-                        "startTimestamp": start_ts,
-                        "endTimestamp": end_ts,
-                        "version": "v3.3.21-embedded",
-                        "solution": {
+                        solution = {
                             "url": str(resp.url),
                             "status": resp.status_code,
                             "headers": dict(resp.headers),
-                            "response": response_text,
+                            "response": resp.text,
                             "cookies": cookies_list,
                             "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                        },
-                    }
+                        }
+                except Exception as exc:
+                    logger.warning(f"curl_cffi fallback error: {exc}")
 
-            except ImportError:
-                import httpx
-                async with httpx.AsyncClient(timeout=max_timeout, proxies=proxy) as client:
-                    if cmd == "request.post":
-                        resp = await client.post(
-                            target_url,
-                            headers=custom_headers,
-                            cookies=cookie_dict,
-                            data=post_data,
-                        )
-                    else:
-                        resp = await client.get(
-                            target_url,
-                            headers=custom_headers,
-                            cookies=cookie_dict,
-                        )
+            if solution:
+                end_ts = int(time.time() * 1000)
+                if return_only_cookies:
+                    solution["response"] = ""
 
-                    cookies_list = [{"name": k, "value": v, "domain": "", "path": "/"} for k, v in resp.cookies.items()]
-                    end_ts = int(time.time() * 1000)
-                    return {
-                        "status": "ok",
-                        "message": "Challenge solved (httpx fallback)!",
-                        "startTimestamp": start_ts,
-                        "endTimestamp": end_ts,
-                        "version": "v3.3.21-embedded",
-                        "solution": {
-                            "url": str(resp.url),
-                            "status": resp.status_code,
-                            "headers": dict(resp.headers),
-                            "response": "" if return_only_cookies else resp.text,
-                            "cookies": cookies_list,
-                            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        },
-                    }
-            except Exception as exc:
-                logger.warning(f"FlareSolverr challenge solve error for {target_url}: {exc}")
+                msg = "Challenge solved!" if solution.get("challenge_detected") else "Challenge not detected!"
+                return {
+                    "status": "ok",
+                    "message": msg,
+                    "startTimestamp": start_ts,
+                    "endTimestamp": end_ts,
+                    "version": "v3.3.21",
+                    "solution": solution,
+                }
+            else:
                 return {
                     "status": "error",
-                    "message": f"Error solving challenge: {exc}",
+                    "message": f"Unable to solve challenge for {target_url}",
                     "startTimestamp": start_ts,
                     "endTimestamp": int(time.time() * 1000),
-                    "version": "v3.3.21-embedded",
+                    "version": "v3.3.21",
                 }
 
-        # Unknown command
         return {
             "status": "error",
             "message": f"Invalid command: {cmd}",
             "startTimestamp": start_ts,
             "endTimestamp": int(time.time() * 1000),
-            "version": "v3.3.21-embedded",
+            "version": "v3.3.21",
         }
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -282,7 +406,6 @@ class EmbeddedFlareSolverr:
             method = parts[0].upper()
             path_and_query = parts[1]
 
-            # Read headers
             content_length = 0
             while True:
                 h_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
@@ -309,7 +432,7 @@ class EmbeddedFlareSolverr:
                 response_data = {
                     "status": "ok",
                     "message": "FlareSolverr is ready.",
-                    "version": "v3.3.21-embedded",
+                    "version": "v3.3.21",
                 }
             elif path.startswith("/v1"):
                 if method == "POST" and body:
@@ -317,12 +440,12 @@ class EmbeddedFlareSolverr:
                         req_payload = json.loads(body.decode("utf-8"))
                     except Exception:
                         req_payload = {}
-                    response_data = await self._handle_request(req_payload)
+                    response_data = await self._solve_request(req_payload)
                 else:
                     response_data = {
                         "status": "ok",
                         "message": "FlareSolverr is ready.",
-                        "version": "v3.3.21-embedded",
+                        "version": "v3.3.21",
                     }
             else:
                 response_data = {

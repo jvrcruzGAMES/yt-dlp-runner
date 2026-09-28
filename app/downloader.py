@@ -4,12 +4,13 @@ import hashlib
 import logging
 import mimetypes
 import os
+import re
 import shutil
+import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
-import yt_dlp
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.args_sanitizer import sanitize_yt_dlp_args
 from app.config import settings
@@ -24,6 +25,77 @@ from app.schemas import (
 
 logger = logging.getLogger("yt_dlp_runner.downloader")
 
+SIZE_MULTIPLIERS = {
+    "b": 1,
+    "kib": 1024,
+    "mib": 1024 ** 2,
+    "gib": 1024 ** 3,
+    "tib": 1024 ** 4,
+    "kb": 1000,
+    "mb": 1000 ** 2,
+    "gb": 1000 ** 3,
+    "tb": 1000 ** 4,
+}
+
+PROGRESS_REGEX = re.compile(
+    r"\[download\]\s+([\d\.]+)%\s+of\s+(?:~)?([\d\.]+[a-zA-Z]+)(?:\s+at\s+([\d\.]+[a-zA-Z]+/s))?(?:\s+ETA\s+(\S+))?"
+)
+COMPLETE_PROGRESS_REGEX = re.compile(
+    r"\[download\]\s+100(?:\.0)?%\s+of\s+(?:~)?([\d\.]+[a-zA-Z]+)"
+)
+DESTINATION_REGEX = re.compile(
+    r"\[(?:download|ExtractAudio|Merger|VideoConvertor|FixupM3u8|EmbedThumbnail)\]\s+(?:Destination:\s+|Merging formats into\s+[\"']?)([^\"'\n]+)"
+)
+WRITING_REGEX = re.compile(
+    r"\[(?:info|download)\]\s+Writing .*? to:\s+(.+)$"
+)
+
+MEDIA_EXTENSIONS: Set[str] = {
+    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
+    ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".flac", ".aac"
+}
+TEMP_EXTENSIONS: Set[str] = {".part", ".ytdl", ".temp", ".tmp"}
+
+
+def parse_size_to_bytes(size_str: str) -> Optional[int]:
+    try:
+        clean = size_str.strip().replace("~", "")
+        match = re.match(r"^([\d\.]+)\s*([a-zA-Z]+)?$", clean)
+        if match:
+            val = float(match.group(1))
+            unit = (match.group(2) or "b").lower()
+            mult = SIZE_MULTIPLIERS.get(unit, 1)
+            return int(val * mult)
+    except Exception:
+        pass
+    return None
+
+
+def parse_eta_to_seconds(eta_str: str) -> Optional[int]:
+    try:
+        parts = eta_str.strip().split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except Exception:
+        pass
+    return None
+
+
+def parse_speed_to_bytes_per_sec(speed_str: str) -> Optional[float]:
+    try:
+        clean = speed_str.strip().replace("/s", "")
+        match = re.match(r"^([\d\.]+)\s*([a-zA-Z]+)?$", clean)
+        if match:
+            val = float(match.group(1))
+            unit = (match.group(2) or "b").lower()
+            mult = SIZE_MULTIPLIERS.get(unit, 1)
+            return float(val * mult)
+    except Exception:
+        pass
+    return None
+
 
 def generate_file_hex_id(filename: str, file_path: Optional[str] = None) -> str:
     """Generates a unique, deterministic 16-character hex identifier for a file."""
@@ -36,7 +108,7 @@ def generate_file_hex_id(filename: str, file_path: Optional[str] = None) -> str:
 
 def create_file_info(filepath: Path, base_url_prefix: str = "/files") -> FileInfo:
     stat = filepath.stat()
-    file_id = generate_file_hex_id(filepath.name, str(filepath))
+    file_id = generate_file_hex_id(filepath.name, str(filepath.resolve()))
     mime_type, _ = mimetypes.guess_type(filepath.name)
     return FileInfo(
         file_id=file_id,
@@ -48,11 +120,64 @@ def create_file_info(filepath: Path, base_url_prefix: str = "/files") -> FileInf
     )
 
 
+def build_yt_dlp_command(
+    request: DownloadRequest,
+    downloads_dir: Path,
+    cookie_path: Optional[str] = None
+) -> Tuple[List[str], List[str]]:
+    """
+    Builds the complete CLI arguments list for running yt-dlp as a subprocess.
+    Returns (cmd_args, stripped_args).
+    """
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-check-certificates",
+        "--newline",
+        "--no-playlist",
+        "--paths", f"home:{downloads_dir}",
+        "--paths", f"temp:{downloads_dir}",
+    ]
+
+    output_template = request.output_template or "%(title)s [%(id)s].%(ext)s"
+    cmd.extend(["-o", output_template])
+
+    if request.format_selection:
+        cmd.extend(["-f", request.format_selection])
+
+    if cookie_path and os.path.exists(cookie_path):
+        cmd.extend(["--cookies", cookie_path])
+
+    if flaresolverr_proxy.is_active:
+        cmd.extend(["--proxy", flaresolverr_proxy.proxy_url])
+
+    pot_url = (
+        getattr(settings, "BGUTIL_POT_PROVIDER_URL", None)
+        or os.getenv("BGUTIL_POT_PROVIDER_URL")
+        or os.getenv("POT_PROVIDER_URL")
+    )
+    if pot_url:
+        cmd.extend([
+            "--extractor-args", f"youtubepot-bgutilhttp:base_url={pot_url}",
+            "--extractor-args", f"youtubepot-bgutil:base_url={pot_url}",
+            "--extractor-args", f"youtubepot:base_url={pot_url}",
+            "--extractor-args", f"youtube:getpot_bgutil_baseurl={pot_url}",
+        ])
+
+    stripped_args: List[str] = []
+    if request.custom_args:
+        sanitized_args, stripped_args = sanitize_yt_dlp_args(request.custom_args)
+        cmd.extend(sanitized_args)
+
+    cmd.append(request.url)
+    return cmd, stripped_args
+
+
 class DownloadTaskManager:
     def __init__(self):
         self.tasks: Dict[str, DownloadTaskResponse] = {}
         self._async_tasks: Dict[str, asyncio.Task] = {}
-        self.file_registry: Dict[str, Path] = {}  # file_id -> Path
+        self._subprocesses: Dict[str, asyncio.subprocess.Process] = {}
+        self.file_registry: Dict[str, Path] = {}  # file_id or filename -> Path
         self.last_activity_time: float = time.time()
         self.total_completed_downloads: int = 0
         self._refresh_file_registry()
@@ -70,24 +195,24 @@ class DownloadTaskManager:
         downloads_path = Path(settings.DOWNLOADS_DIR)
         file_infos: List[FileInfo] = []
         if downloads_path.exists():
-            for f in downloads_path.iterdir():
-                if f.is_file():
-                    info = create_file_info(f)
-                    self.file_registry[info.file_id] = f
-                    # Also map filename for convenience
-                    self.file_registry[f.name] = f
-                    file_infos.append(info)
+            for f in downloads_path.rglob("*"):
+                if f.is_file() and f.suffix.lower() not in TEMP_EXTENSIONS:
+                    try:
+                        info = create_file_info(f)
+                        self.file_registry[info.file_id] = f
+                        self.file_registry[f.name] = f
+                        file_infos.append(info)
+                    except OSError:
+                        continue
         return file_infos
 
     def get_file_by_id_or_name(self, identifier: str) -> Optional[Path]:
         self.touch_activity()
-        # Check cache
         if identifier in self.file_registry:
             path = self.file_registry[identifier]
             if path.is_file() and path.exists():
                 return path
 
-        # Rescan downloads dir
         self._refresh_file_registry()
         return self.file_registry.get(identifier)
 
@@ -108,7 +233,6 @@ class DownloadTaskManager:
         )
         self.tasks[task_id] = task_record
 
-        # Launch background task
         async_task = asyncio.create_task(self._execute_download(task_id, request))
         self._async_tasks[task_id] = async_task
         return task_record
@@ -118,31 +242,41 @@ class DownloadTaskManager:
         cookie_path: Optional[str] = None
         start_timestamp = time.time()
 
-        # Snapshot files before download to detect newly created / modified ones
+        settings.ensure_directories()
         downloads_dir = Path(settings.DOWNLOADS_DIR)
-        before_files = {
-            f.name: f.stat().st_mtime for f in downloads_dir.iterdir() if f.is_file()
-        } if downloads_dir.exists() else {}
+
+        # Snapshot existing files before download
+        before_files: Dict[Path, float] = {}
+        if downloads_dir.exists():
+            for f in downloads_dir.rglob("*"):
+                if f.is_file():
+                    try:
+                        before_files[f.resolve()] = f.stat().st_mtime
+                    except OSError:
+                        pass
 
         try:
             self.touch_activity()
 
-            # 0. Install plugins dynamically if specified in the job request
+            # 0. Ensure yt-dlp and any client-requested plugins are installed via pip
+            packages_to_install = ["yt-dlp"]
             if request.plugins:
-                task.status = "installing_plugins"
-                task.logs.append(f"Installing {len(request.plugins)} plugin(s) for job: {request.plugins}")
-                plugin_resp = await plugin_manager.install_plugins(
-                    PluginInstallRequest(packages=request.plugins)
-                )
-                if plugin_resp.success:
-                    task.logs.append(f"Successfully installed plugins: {request.plugins}")
-                else:
-                    task.logs.append(f"Plugin install output/warning: {plugin_resp.stderr or plugin_resp.stdout}")
+                packages_to_install.extend(request.plugins)
+
+            task.status = "installing_plugins"
+            task.logs.append(f"Installing/verifying packages via pip: {packages_to_install}")
+            plugin_resp = await plugin_manager.install_plugins(
+                PluginInstallRequest(packages=packages_to_install, upgrade=True)
+            )
+            if plugin_resp.success:
+                task.logs.append(f"Successfully installed/verified packages: {packages_to_install}")
+            else:
+                task.logs.append(f"Package install output/warning: {plugin_resp.stderr or plugin_resp.stdout}")
 
             task.status = "downloading"
-            task.logs.append(f"Starting download for URL: {request.url}")
+            task.logs.append(f"Starting yt-dlp CLI download for URL: {request.url}")
 
-            # 1. Handle cookie file if provided (saved in isolated cookies dir)
+            # 1. Handle cookie file if provided
             if request.cookie_content:
                 cookie_filename = f"cookie_{task_id}.txt"
                 cookie_path = os.path.join(settings.COOKIES_DIR, cookie_filename)
@@ -150,167 +284,124 @@ class DownloadTaskManager:
                     f.write(request.cookie_content)
                 task.logs.append(f"Wrote cookie file to isolated storage at: {cookie_path}")
 
-            # 2. Setup output path template in downloads directory
-            output_template = request.output_template or "%(title)s [%(id)s].%(ext)s"
-            outtmpl = os.path.join(settings.DOWNLOADS_DIR, output_template)
+            # 2. Build CLI arguments
+            cmd, stripped_args = build_yt_dlp_command(request, downloads_dir, cookie_path)
+            if stripped_args:
+                task.logs.append(f"Stripped worker-reserved arguments: {stripped_args}")
+            task.logs.append(f"Executing CLI command: {' '.join(cmd)}")
 
-            # 3. Setup yt-dlp logger and progress hook
-            def ydl_progress_hook(d: dict):
+            # 3. Spawn subprocess and read stdout/stderr in real-time
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(downloads_dir.resolve()),
+            )
+            self._subprocesses[task_id] = process
+
+            explicit_paths: List[Path] = []
+
+            while True:
+                line_bytes = await process.stdout.readline()
+                if not line_bytes:
+                    break
+                raw_line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not raw_line:
+                    continue
+
                 self.touch_activity()
-                status = d.get("status")
-                if status == "downloading":
-                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                    downloaded = d.get("downloaded_bytes") or 0
-                    task.downloaded_bytes = downloaded
-                    task.total_bytes = total if total > 0 else None
-                    if total > 0:
-                        task.progress_percent = round((downloaded / total) * 100, 2)
-                    task.speed_bytes_per_sec = d.get("speed")
-                    task.eta_seconds = d.get("eta")
-                elif status == "finished":
-                    task.status = "processing"
-                    task.progress_percent = 100.0
-                    filename = d.get("filename")
-                    if filename:
-                        task.filepath = filename
-                        task.filename = os.path.basename(filename)
-                    task.logs.append("Download finished, processing/merging formats...")
 
-            class CustomYDLLogger:
-                def debug(self, msg):
-                    if not msg.startswith("[debug]"):
-                        task.logs.append(msg)
-
-                def warning(self, msg):
-                    task.logs.append(f"[WARNING] {msg}")
-
-                def error(self, msg):
-                    task.logs.append(f"[ERROR] {msg}")
-
-            # 4. Prepare yt-dlp options (nocheckcertificate=True is required for mitmproxy)
-            ydl_opts: Dict[str, Any] = {
-                "outtmpl": outtmpl,
-                "progress_hooks": [ydl_progress_hook],
-                "logger": CustomYDLLogger(),
-                "noplaylist": True,
-                "nocheckcertificate": True,
-            }
-
-            # Configure bgutil YouTube POT token provider if specified
-            pot_url = getattr(settings, "BGUTIL_POT_PROVIDER_URL", None) or os.getenv("BGUTIL_POT_PROVIDER_URL") or os.getenv("POT_PROVIDER_URL")
-            if pot_url:
-                extractor_args = ydl_opts.setdefault("extractor_args", {})
-                for ext_name in ["youtubepot-bgutilhttp", "youtubepot-bgutil", "youtubepot"]:
-                    ext_dict = extractor_args.setdefault(ext_name, {})
-                    if "base_url" not in ext_dict:
-                        ext_dict["base_url"] = [pot_url]
-                yt_dict = extractor_args.setdefault("youtube", {})
-                if "getpot_bgutil_baseurl" not in yt_dict:
-                    yt_dict["getpot_bgutil_baseurl"] = [pot_url]
-                task.logs.append(f"Configured bgutil POT provider base_url: {pot_url}")
-
-            # Route through FlareSolverr mitmproxy ONLY if actively running
-            if flaresolverr_proxy.is_active:
-                ydl_opts["proxy"] = flaresolverr_proxy.proxy_url
-                task.logs.append(f"Routing through FlareSolverr mitmproxy at: {flaresolverr_proxy.proxy_url}")
-
-            if cookie_path and os.path.exists(cookie_path):
-                ydl_opts["cookiefile"] = cookie_path
-
-            if request.format_selection:
-                ydl_opts["format"] = request.format_selection
-
-            # Sanitize and strip any disallowed / worker-reserved CLI arguments (including client-defined --proxy)
-            if request.custom_args:
-                sanitized_args, stripped_args = sanitize_yt_dlp_args(request.custom_args)
-                if stripped_args:
-                    task.logs.append(f"Stripped worker-reserved arguments: {stripped_args}")
-                if sanitized_args:
+                # Parse progress percentage, size, speed, ETA
+                prog_match = PROGRESS_REGEX.search(raw_line)
+                if prog_match:
                     try:
-                        default_cli_opts = yt_dlp.parse_options([])[3]
-                        user_cli_opts = yt_dlp.parse_options(sanitized_args)[3]
+                        pct = float(prog_match.group(1))
+                        task.progress_percent = pct
+                        total_str = prog_match.group(2)
+                        total_bytes = parse_size_to_bytes(total_str)
+                        if total_bytes:
+                            task.total_bytes = total_bytes
+                            task.downloaded_bytes = int(total_bytes * (pct / 100.0))
 
-                        disallowed_override_keys = {
-                            "proxy", "outtmpl", "cookiefile", "cookiesfrombrowser",
-                            "logger", "progress_hooks", "paths"
-                        }
+                        speed_str = prog_match.group(3)
+                        if speed_str:
+                            task.speed_bytes_per_sec = parse_speed_to_bytes_per_sec(speed_str)
 
-                        # Apply only options explicitly modified by user CLI arguments
-                        for k, v in user_cli_opts.items():
-                            if k in disallowed_override_keys:
-                                continue
-                            if default_cli_opts.get(k) != v:
-                                if k == "postprocessors" and v:
-                                    existing_pp = ydl_opts.get("postprocessors", [])
-                                    ydl_opts["postprocessors"] = existing_pp + [
-                                        p for p in v if p not in existing_pp
-                                    ]
-                                elif k == "extractor_args" and v:
-                                    # Merge user extractor_args
-                                    curr_ea = ydl_opts.setdefault("extractor_args", {})
-                                    for ext_k, ext_v in v.items():
-                                        curr_ea.setdefault(ext_k, {}).update(ext_v)
-                                else:
-                                    ydl_opts[k] = v
+                        eta_str = prog_match.group(4)
+                        if eta_str:
+                            task.eta_seconds = parse_eta_to_seconds(eta_str)
+                    except Exception:
+                        pass
+                elif COMPLETE_PROGRESS_REGEX.search(raw_line):
+                    task.progress_percent = 100.0
+                    task.status = "processing"
 
-                        task.logs.append(f"Successfully applied custom yt-dlp CLI options: {sanitized_args}")
-                    except Exception as parse_err:
-                        task.logs.append(f"Warning: Could not parse custom args {sanitized_args}: {parse_err}")
+                # Parse destination and written file paths
+                dest_match = DESTINATION_REGEX.search(raw_line)
+                if dest_match:
+                    p_str = dest_match.group(1).strip().strip("'\"")
+                    dest_p = Path(p_str)
+                    if not dest_p.is_absolute():
+                        dest_p = downloads_dir / dest_p
+                    explicit_paths.append(dest_p)
 
-            # Ensure no SSL checking is always enforced (required for mitmproxy)
-            ydl_opts["nocheckcertificate"] = True
+                write_match = WRITING_REGEX.search(raw_line)
+                if write_match:
+                    p_str = write_match.group(1).strip().strip("'\"")
+                    dest_p = Path(p_str)
+                    if not dest_p.is_absolute():
+                        dest_p = downloads_dir / dest_p
+                    explicit_paths.append(dest_p)
 
-            # Run extraction and download in thread pool
-            loop = asyncio.get_running_loop()
+                # Keep logs manageable: append non-progress lines or milestones
+                if not raw_line.startswith("[download]") or "%" not in raw_line or "100%" in raw_line:
+                    task.logs.append(raw_line)
 
-            def run_ydl():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(request.url, download=True)
-                    if info:
-                        actual_filename = ydl.prepare_filename(info)
-                        return actual_filename, info
-                    return None, None
+            return_code = await process.wait()
+            self._subprocesses.pop(task_id, None)
 
-            actual_filepath, info_dict = await loop.run_in_executor(None, run_ydl)
-
-            # 5. Detect all generated files for this task
+            # 4. Discover all output files generated during this run (media and non-media)
             discovered_files: List[FileInfo] = []
             candidate_paths: List[Path] = []
 
-            if actual_filepath:
-                candidate_paths.append(Path(actual_filepath))
-            if info_dict:
-                if "_filename" in info_dict:
-                    candidate_paths.append(Path(info_dict["_filename"]))
-                if "filepath" in info_dict:
-                    candidate_paths.append(Path(info_dict["filepath"]))
-                for req_dl in info_dict.get("requested_downloads", []):
-                    if "filepath" in req_dl:
-                        candidate_paths.append(Path(req_dl["filepath"]))
-                    if "_filename" in req_dl:
-                        candidate_paths.append(Path(req_dl["_filename"]))
+            for ep in explicit_paths:
+                if ep.is_file() and ep.exists() and ep.suffix.lower() not in TEMP_EXTENSIONS:
+                    if ep not in candidate_paths:
+                        candidate_paths.append(ep)
 
-            # Register any candidate paths that exist on disk
+            if downloads_dir.exists():
+                for f in downloads_dir.rglob("*"):
+                    if not f.is_file() or f.suffix.lower() in TEMP_EXTENSIONS:
+                        continue
+                    try:
+                        mtime = f.stat().st_mtime
+                        resolved = f.resolve()
+                        if resolved not in before_files or mtime >= (start_timestamp - 2.0):
+                            if f not in candidate_paths:
+                                candidate_paths.append(f)
+                    except OSError:
+                        continue
+
+            # Prioritize media files, then sort by file size descending
+            def sort_key(p: Path):
+                is_media = p.suffix.lower() in MEDIA_EXTENSIONS
+                try:
+                    size = p.stat().st_size
+                except Exception:
+                    size = 0
+                return (0 if is_media else 1, -size)
+
+            candidate_paths.sort(key=sort_key)
+
             for cp in candidate_paths:
-                if cp.is_file() and cp.exists():
+                try:
                     info = create_file_info(cp)
                     if not any(df.file_id == info.file_id for df in discovered_files):
                         self.file_registry[info.file_id] = cp
                         self.file_registry[cp.name] = cp
                         discovered_files.append(info)
-
-            # Also scan downloads directory for newly created or modified files
-            if downloads_dir.exists():
-                for f in downloads_dir.iterdir():
-                    if not f.is_file():
-                        continue
-                    mtime = f.stat().st_mtime
-                    if f.name not in before_files or mtime >= (start_timestamp - 1.0):
-                        info = create_file_info(f)
-                        if not any(df.file_id == info.file_id for df in discovered_files):
-                            self.file_registry[info.file_id] = f
-                            self.file_registry[f.name] = f
-                            discovered_files.append(info)
+                except Exception as ex:
+                    logger.warning(f"Error creating file info for {cp}: {ex}")
 
             if discovered_files:
                 task.filepath = str(self.file_registry[discovered_files[0].file_id])
@@ -319,14 +410,18 @@ class DownloadTaskManager:
                 task.status = "completed"
                 task.progress_percent = 100.0
                 task.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                task.logs.append(f"Task completed. Generated {len(discovered_files)} file(s).")
+                file_names = [f.filename for f in discovered_files]
+                task.logs.append(f"Task completed successfully. Generated {len(discovered_files)} file(s): {file_names}")
                 self.total_completed_downloads += 1
                 self.touch_activity()
             else:
                 task.status = "failed"
-                task.error = "Download completed without generating any output files."
+                if return_code != 0:
+                    task.error = f"yt-dlp process exited with error code {return_code}"
+                else:
+                    task.error = "Download completed without generating any output files."
                 task.completed_at = datetime.datetime.now(datetime.timezone.utc)
-                task.logs.append("ERROR: No output files were produced by yt-dlp.")
+                task.logs.append(f"ERROR: {task.error}")
                 self.touch_activity()
 
         except asyncio.CancelledError:
@@ -341,6 +436,12 @@ class DownloadTaskManager:
             task.completed_at = datetime.datetime.now(datetime.timezone.utc)
             task.logs.append(f"Error: {e}")
         finally:
+            if task_id in self._subprocesses:
+                p = self._subprocesses.pop(task_id)
+                try:
+                    p.kill()
+                except Exception:
+                    pass
             if cookie_path and os.path.exists(cookie_path):
                 try:
                     os.remove(cookie_path)
@@ -348,11 +449,19 @@ class DownloadTaskManager:
                     logger.warning(f"Could not remove cookie file {cookie_path}: {ex}")
 
     def cancel_task(self, task_id: str) -> bool:
+        cancelled = False
+        if task_id in self._subprocesses:
+            try:
+                self._subprocesses[task_id].kill()
+                cancelled = True
+            except Exception:
+                pass
         if task_id in self._async_tasks and not self._async_tasks[task_id].done():
             self._async_tasks[task_id].cancel()
+            cancelled = True
+        if cancelled:
             self.touch_activity()
-            return True
-        return False
+        return cancelled
 
     def get_task(self, task_id: str) -> Optional[DownloadTaskResponse]:
         self.touch_activity()

@@ -4,8 +4,16 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from app.args_sanitizer import sanitize_yt_dlp_args
 from app.config import settings
+from app.downloader import (
+    build_yt_dlp_command,
+    downloader_manager,
+    parse_eta_to_seconds,
+    parse_size_to_bytes,
+    parse_speed_to_bytes_per_sec,
+)
 from app.main import app
 from app.plugins import normalize_plugin_spec
+from app.schemas import DownloadRequest
 
 
 def test_sanitize_yt_dlp_args():
@@ -73,6 +81,46 @@ def test_normalize_plugin_spec():
     assert normalize_plugin_spec("git+ssh://git@github.com/user/repo.git") == "git+ssh://git@github.com/user/repo.git"
 
 
+def test_build_yt_dlp_command():
+    req = DownloadRequest(
+        url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        format_selection="bestvideo+bestaudio/best",
+        output_template="%(title)s [%(id)s].%(ext)s",
+        custom_args=["--write-subs", "--sub-lang", "en", "--write-thumbnail", "--proxy", "http://evil:8080"],
+    )
+    downloads_dir = Path(settings.DOWNLOADS_DIR)
+    cmd, stripped = build_yt_dlp_command(req, downloads_dir)
+
+    assert "-m" in cmd
+    assert "yt_dlp" in cmd
+    assert "--no-check-certificates" in cmd
+    assert "--paths" in cmd
+    assert f"home:{downloads_dir}" in cmd
+    assert "-f" in cmd
+    assert "bestvideo+bestaudio/best" in cmd
+    assert "--write-subs" in cmd
+    assert "--sub-lang" in cmd
+    assert "en" in cmd
+    assert "--write-thumbnail" in cmd
+    assert "--proxy" not in cmd  # Stripped worker-reserved proxy
+    assert "http://evil:8080" not in cmd
+    assert cmd[-1] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def test_progress_parsing_helpers():
+    assert parse_size_to_bytes("10.23MiB") == int(10.23 * 1024 * 1024)
+    assert parse_size_to_bytes("500KiB") == 500 * 1024
+    assert parse_size_to_bytes("1.5GB") == int(1.5 * 1000 * 1000 * 1000)
+    assert parse_size_to_bytes("~25.50MiB") == int(25.5 * 1024 * 1024)
+
+    assert parse_eta_to_seconds("00:45") == 45
+    assert parse_eta_to_seconds("01:30") == 90
+    assert parse_eta_to_seconds("01:10:05") == 3600 + 600 + 5
+
+    assert parse_speed_to_bytes_per_sec("2.50MiB/s") == 2.5 * 1024 * 1024
+    assert parse_speed_to_bytes_per_sec("100KiB/s") == 100 * 1024
+
+
 @pytest.mark.asyncio
 async def test_supervisor_health_and_activity():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -96,28 +144,44 @@ async def test_cookie_directory_isolation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_file_listing_and_hex_streaming():
+async def test_file_listing_and_hex_streaming_multi_format():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        # Create two test files in downloads directory (e.g. video + subtitle)
-        test_video = Path(settings.DOWNLOADS_DIR) / "test_video.mp4"
-        test_sub = Path(settings.DOWNLOADS_DIR) / "test_video.en.vtt"
+        # Create media and non-media test files in downloads directory (video, subtitle, thumbnail, description, json)
+        downloads_dir = Path(settings.DOWNLOADS_DIR)
+        test_video = downloads_dir / "test_video.mp4"
+        test_sub = downloads_dir / "test_video.en.vtt"
+        test_thumb = downloads_dir / "test_video.webp"
+        test_desc = downloads_dir / "test_video.description"
+        test_json = downloads_dir / "test_video.info.json"
+
         test_video.write_bytes(b"dummy video data")
         test_sub.write_bytes(b"WEBVTT subtitle data")
+        test_thumb.write_bytes(b"RIFFWEBP thumbnail data")
+        test_desc.write_text("Test video description")
+        test_json.write_text('{"id": "123", "title": "Test Video"}')
 
         try:
             resp = await client.get("/files")
             assert resp.status_code == 200
             files = resp.json()
-            assert len(files) >= 2
+            assert len(files) >= 5
 
-            video_item = [f for f in files if f["filename"] == "test_video.mp4"][0]
+            filenames = [f["filename"] for f in files]
+            assert "test_video.mp4" in filenames
+            assert "test_video.en.vtt" in filenames
+            assert "test_video.webp" in filenames
+            assert "test_video.description" in filenames
+            assert "test_video.info.json" in filenames
+
+            video_item = next(f for f in files if f["filename"] == "test_video.mp4")
             assert "file_id" in video_item
             assert len(video_item["file_id"]) == 16
             assert f"/files/{video_item['file_id']}/download" == video_item["download_url"]
 
-            sub_item = [f for f in files if f["filename"] == "test_video.en.vtt"][0]
-            assert "file_id" in sub_item
-            assert sub_item["file_id"] != video_item["file_id"]
+            sub_item = next(f for f in files if f["filename"] == "test_video.en.vtt")
+            thumb_item = next(f for f in files if f["filename"] == "test_video.webp")
+            desc_item = next(f for f in files if f["filename"] == "test_video.description")
+            json_item = next(f for f in files if f["filename"] == "test_video.info.json")
 
             # Stream video using hex ID
             stream_video = await client.get(f"/files/{video_item['file_id']}/download")
@@ -128,24 +192,22 @@ async def test_file_listing_and_hex_streaming():
             stream_sub = await client.get(f"/files/{sub_item['file_id']}/download")
             assert stream_sub.status_code == 200
             assert stream_sub.content == b"WEBVTT subtitle data"
+
+            # Stream thumbnail
+            stream_thumb = await client.get(f"/files/{thumb_item['file_id']}/download")
+            assert stream_thumb.status_code == 200
+            assert stream_thumb.content == b"RIFFWEBP thumbnail data"
+
+            # Stream description
+            stream_desc = await client.get(f"/files/{desc_item['file_id']}/download")
+            assert stream_desc.status_code == 200
+            assert stream_desc.text == "Test video description"
+
+            # Stream json
+            stream_json = await client.get(f"/files/{json_item['file_id']}/download")
+            assert stream_json.status_code == 200
+            assert '"title": "Test Video"' in stream_json.text
         finally:
-            if test_video.exists():
-                test_video.unlink()
-            if test_sub.exists():
-                test_sub.unlink()
-
-
-def test_pot_provider_extractor_args():
-    import yt_dlp
-    pot_url = "http://bgutil-server:4416"
-    ydl_opts = {}
-    extractor_args = ydl_opts.setdefault("extractor_args", {})
-    for ext_name in ["youtubepot-bgutilhttp", "youtubepot-bgutil", "youtubepot"]:
-        ext_dict = extractor_args.setdefault(ext_name, {})
-        ext_dict["base_url"] = [pot_url]
-    yt_dict = extractor_args.setdefault("youtube", {})
-    yt_dict["getpot_bgutil_baseurl"] = [pot_url]
-
-    assert ydl_opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"] == ["http://bgutil-server:4416"]
-    assert ydl_opts["extractor_args"]["youtube"]["getpot_bgutil_baseurl"] == ["http://bgutil-server:4416"]
-
+            for p in [test_video, test_sub, test_thumb, test_desc, test_json]:
+                if p.exists():
+                    p.unlink()

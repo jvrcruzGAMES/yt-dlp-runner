@@ -9,18 +9,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DENO_INSTALL=/usr/local \
     PATH="/usr/local/bin:${PATH}"
 
-# Install ffmpeg, curl, unzip, git, ca-certificates, chromium, xvfb, nodejs, npm and native canvas build tools
+# Install Node.js 24 from NodeSource, ffmpeg, curl, unzip, git, ca-certificates, chromium, xvfb, and native canvas build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
     curl \
+    ca-certificates \
+    gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends \
+    nodejs \
+    ffmpeg \
     unzip \
     git \
-    ca-certificates \
     chromium \
     chromium-driver \
     xvfb \
-    nodejs \
-    npm \
     build-essential \
     libcairo2-dev \
     libpango1.0-dev \

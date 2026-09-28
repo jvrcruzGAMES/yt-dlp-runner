@@ -351,6 +351,13 @@ class DownloadTaskManager:
             cmd, stripped_args = build_yt_dlp_command(request, downloads_dir, cookie_path)
             if stripped_args:
                 task.logs.append(f"Stripped worker-reserved arguments: {stripped_args}")
+
+            # Route traffic through FlareSolverr proxy if active
+            # Traffic: yt-dlp -> FlareSolverr Proxy (mitmproxy) -> FlareSolverr -> User defined proxy (if defined)
+            if flaresolverr_proxy.is_active and getattr(settings, "USE_FLARESOLVERR_PROXY", True):
+                cmd.insert(-1, "--proxy")
+                cmd.insert(-1, flaresolverr_proxy.proxy_url)
+
             task.logs.append(f"Executing CLI command: {' '.join(cmd)}")
 
             # 3. Spawn subprocess with DEVNULL stdin to prevent hanging

@@ -107,6 +107,19 @@ class EmbeddedFlareSolverr:
             env["LOG_LEVEL"] = env.get("LOG_LEVEL", "info")
             env["HEADLESS"] = env.get("HEADLESS", "true")
 
+            proxy_url = (
+                os.getenv("HTTP_PROXY")
+                or os.getenv("http_proxy")
+                or os.getenv("FLARESOLVERR_PROXY")
+                or os.getenv("PROXY_URL")
+            )
+            if proxy_url:
+                env["PROXY_URL"] = proxy_url
+                env["HTTP_PROXY"] = proxy_url
+                env["http_proxy"] = proxy_url
+                env["HTTPS_PROXY"] = proxy_url
+                env["https_proxy"] = proxy_url
+
             try:
                 logger.info(f"Launching official FlareSolverr from source: {resolved_script} on {self.host}:{self.port}...")
                 self._process = await asyncio.create_subprocess_exec(
@@ -342,8 +355,14 @@ class EmbeddedFlareSolverr:
                 proxy = payload["proxy"].get("url")
             elif active_session and active_session.proxy:
                 proxy = active_session.proxy
+            elif os.getenv("HTTP_PROXY"):
+                proxy = os.getenv("HTTP_PROXY")
+            elif os.getenv("http_proxy"):
+                proxy = os.getenv("http_proxy")
             elif os.getenv("FLARESOLVERR_PROXY"):
                 proxy = os.getenv("FLARESOLVERR_PROXY")
+            elif os.getenv("PROXY_URL"):
+                proxy = os.getenv("PROXY_URL")
 
             cookies_param = payload.get("cookies") or []
             headers_param = payload.get("headers") or {}

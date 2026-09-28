@@ -38,6 +38,16 @@ class FlareSolverrProxyService:
             "--quiet",
         ]
 
+        upstream_proxy = (
+            getattr(settings, "HTTP_PROXY", None)
+            or os.getenv("HTTP_PROXY")
+            or os.getenv("http_proxy")
+            or os.getenv("FLARESOLVERR_PROXY")
+            or os.getenv("PROXY_URL")
+        )
+        if upstream_proxy:
+            cmd.extend(["--mode", f"upstream:{upstream_proxy}"])
+
         try:
             logger.info(f"Starting mitmproxy FlareSolverr solver on port {self.proxy_port}...")
             self._process = await asyncio.create_subprocess_exec(

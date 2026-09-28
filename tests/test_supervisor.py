@@ -380,4 +380,13 @@ async def test_embedded_flaresolverr_endpoints():
         assert solver.is_active is False
 
 
+def test_runner_http_proxy_support(monkeypatch):
+    from app.config import RunnerSettings
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.corp.internal:3128")
+    custom_settings = RunnerSettings()
+    assert custom_settings.HTTP_PROXY == "http://proxy.corp.internal:3128"
+    assert custom_settings.FLARESOLVERR_PROXY == "http://proxy.corp.internal:3128"
+
+
 

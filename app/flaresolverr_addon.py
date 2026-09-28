@@ -8,7 +8,12 @@ from mitmproxy import ctx, http
 logger = logging.getLogger("yt_dlp_flaresolverr")
 
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://127.0.0.1:8191/v1")
-FLARESOLVERR_PROXY = os.getenv("FLARESOLVERR_PROXY", None)
+FLARESOLVERR_PROXY = (
+    os.getenv("HTTP_PROXY")
+    or os.getenv("http_proxy")
+    or os.getenv("FLARESOLVERR_PROXY")
+    or os.getenv("PROXY_URL")
+)
 
 
 class FlareSolverrAddon:

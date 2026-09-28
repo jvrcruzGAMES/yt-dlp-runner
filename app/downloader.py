@@ -43,12 +43,14 @@ PROGRESS_REGEX = re.compile(
 COMPLETE_PROGRESS_REGEX = re.compile(
     r"\[download\]\s+100(?:\.0)?%\s+of\s+(?:~)?([\d\.]+[a-zA-Z]+)"
 )
-DESTINATION_REGEX = re.compile(
-    r"\[(?:download|ExtractAudio|Merger|VideoConvertor|FixupM3u8|EmbedThumbnail)\]\s+(?:Destination:\s+|Merging formats into\s+[\"']?)([^\"'\n]+)"
-)
-WRITING_REGEX = re.compile(
-    r"\[(?:info|download)\]\s+Writing .*? to:\s+(.+)$"
-)
+DESTINATION_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\[(?:download|ExtractAudio|VideoConvertor|Fixup[a-zA-Z0-9]+|Embed[a-zA-Z0-9]+|ModifyChapters|Thumbnail)\]\s+Destination:\s+(.+)$"),
+    re.compile(r"\[(?:Merger|Fixup[a-zA-Z0-9]+|ModifyChapters)\]\s+(?:Merging formats into|Correcting container in|Writing chapters to)\s+[\"']?([^\"'\n]+)[\"']?"),
+    re.compile(r"\[download\]\s+(.+?)\s+has already been downloaded"),
+    re.compile(r"\[(?:info|download)\]\s+Writing .*? to:\s+(.+)$"),
+    re.compile(r"\[MoveFiles\]\s+Moving file .*? to\s+[\"']?([^\"'\n]+)[\"']?"),
+    re.compile(r"\[ffmpeg\]\s+(?:Merging formats into|Destination:)\s+[\"']?([^\"'\n]+)[\"']?"),
+]
 
 MEDIA_EXTENSIONS: Set[str] = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
@@ -177,13 +179,16 @@ def build_yt_dlp_command(
     Builds the complete CLI arguments list for running yt-dlp as a subprocess.
     Returns (cmd_args, stripped_args).
     """
+    abs_downloads = str(downloads_dir.resolve())
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-check-certificates",
         "--newline",
         "--no-playlist",
-        "--paths", f"home:{downloads_dir}",
-        "--paths", f"temp:{downloads_dir}",
+        "--no-mtime",
+        "--paths", abs_downloads,
+        "--paths", f"home:{abs_downloads}",
+        "--paths", f"temp:{abs_downloads}",
     ]
 
     output_template = request.output_template or "%(title)s [%(id)s].%(ext)s"
@@ -292,14 +297,22 @@ class DownloadTaskManager:
 
         settings.ensure_directories()
         downloads_dir = Path(settings.DOWNLOADS_DIR)
+        cwd_dir = Path.cwd().resolve()
 
-        # Snapshot existing files before download
-        before_files: Dict[Path, float] = {}
+        # Snapshot existing files before download (path -> (mtime, size))
+        before_files: Dict[Path, Tuple[float, int]] = {}
         if downloads_dir.exists():
             for f in downloads_dir.rglob("*"):
                 if f.is_file():
                     try:
-                        before_files[f.resolve()] = f.stat().st_mtime
+                        before_files[f.resolve()] = (f.stat().st_mtime, f.stat().st_size)
+                    except OSError:
+                        pass
+        if cwd_dir != downloads_dir.resolve() and cwd_dir.exists():
+            for f in cwd_dir.rglob("*"):
+                if f.is_file():
+                    try:
+                        before_files[f.resolve()] = (f.stat().st_mtime, f.stat().st_size)
                     except OSError:
                         pass
 
@@ -349,6 +362,7 @@ class DownloadTaskManager:
             self._subprocesses[task_id] = process
 
             explicit_paths: List[Path] = []
+            last_error_message: Optional[str] = None
 
             async for line_text in stream_subprocess_lines(process.stdout):
                 raw_line = line_text.strip()
@@ -356,6 +370,9 @@ class DownloadTaskManager:
                     continue
 
                 self.touch_activity()
+
+                if "ERROR:" in raw_line or "error:" in raw_line.lower():
+                    last_error_message = raw_line
 
                 # Parse progress percentage, size, speed, ETA
                 prog_match = PROGRESS_REGEX.search(raw_line)
@@ -382,22 +399,15 @@ class DownloadTaskManager:
                     task.progress_percent = 100.0
                     task.status = "processing"
 
-                # Parse destination and written file paths
-                dest_match = DESTINATION_REGEX.search(raw_line)
-                if dest_match:
-                    p_str = dest_match.group(1).strip().strip("'\"")
-                    dest_p = Path(p_str)
-                    if not dest_p.is_absolute():
-                        dest_p = downloads_dir / dest_p
-                    explicit_paths.append(dest_p)
-
-                write_match = WRITING_REGEX.search(raw_line)
-                if write_match:
-                    p_str = write_match.group(1).strip().strip("'\"")
-                    dest_p = Path(p_str)
-                    if not dest_p.is_absolute():
-                        dest_p = downloads_dir / dest_p
-                    explicit_paths.append(dest_p)
+                # Parse destination and written file paths from all patterns
+                for pat in DESTINATION_PATTERNS:
+                    m = pat.search(raw_line)
+                    if m:
+                        p_str = m.group(1).strip().strip("'\"")
+                        dest_p = Path(p_str)
+                        if not dest_p.is_absolute():
+                            dest_p = downloads_dir / dest_p
+                        explicit_paths.append(dest_p)
 
                 # Keep logs manageable: append non-progress lines or milestones
                 if not raw_line.startswith("[download]") or "%" not in raw_line or "100%" in raw_line:
@@ -415,14 +425,41 @@ class DownloadTaskManager:
                     if ep not in candidate_paths:
                         candidate_paths.append(ep)
 
-            if downloads_dir.exists():
-                for f in downloads_dir.rglob("*"):
+            # Search downloads_dir and cwd
+            search_dirs = [downloads_dir]
+            if cwd_dir != downloads_dir.resolve() and cwd_dir.exists():
+                search_dirs.append(cwd_dir)
+
+            for sdir in search_dirs:
+                for f in sdir.rglob("*"):
                     if not f.is_file() or f.suffix.lower() in TEMP_EXTENSIONS:
                         continue
+                    if sdir == cwd_dir and sdir != downloads_dir.resolve():
+                        if f.suffix.lower() in {".py", ".pyc", ".txt", ".md", ".yml", ".yaml", ".ini", ".sh"}:
+                            continue
+                        if any(part in str(f) for part in ["site-packages", ".git", "__pycache__", "tests", "app"]):
+                            continue
+
                     try:
-                        mtime = f.stat().st_mtime
+                        st = f.stat()
+                        mtime = st.st_mtime
+                        size = st.st_size
                         resolved = f.resolve()
-                        if resolved not in before_files or mtime >= (start_timestamp - 2.0):
+
+                        if (
+                            resolved not in before_files
+                            or before_files.get(resolved) != (mtime, size)
+                            or mtime >= (start_timestamp - 5.0)
+                        ):
+                            # If file dropped into cwd, move it to downloads_dir
+                            if sdir == cwd_dir and sdir != downloads_dir.resolve():
+                                target_dest = downloads_dir / f.name
+                                try:
+                                    shutil.move(str(f), str(target_dest))
+                                    f = target_dest
+                                except Exception as mv_err:
+                                    logger.warning(f"Could not move file {f} to {downloads_dir}: {mv_err}")
+
                             if f not in candidate_paths:
                                 candidate_paths.append(f)
                     except OSError:
@@ -462,7 +499,9 @@ class DownloadTaskManager:
                 self.touch_activity()
             else:
                 task.status = "failed"
-                if return_code != 0:
+                if last_error_message:
+                    task.error = last_error_message
+                elif return_code != 0:
                     task.error = f"yt-dlp process exited with error code {return_code}"
                 else:
                     task.error = "Download completed without generating any output files."

@@ -95,7 +95,8 @@ def test_build_yt_dlp_command():
     assert "yt_dlp" in cmd
     assert "--no-check-certificates" in cmd
     assert "--paths" in cmd
-    assert f"home:{downloads_dir}" in cmd
+    assert f"home:{downloads_dir.resolve()}" in cmd
+    assert "--no-mtime" in cmd
     assert "-f" in cmd
     assert "bestvideo+bestaudio/best" in cmd
     assert "--write-subs" in cmd

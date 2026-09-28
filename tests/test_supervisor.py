@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 import pytest
@@ -238,4 +239,72 @@ async def test_stream_subprocess_lines_handling_large_chunks_and_carriage_return
     assert "[download]  10% of 100MB" in collected
     assert "[download]  50% of 100MB" in collected
     assert "[download] 100% of 100MB" in collected
+
+
+@pytest.mark.asyncio
+async def test_write_info_json_download_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "DOWNLOADS_DIR", str(tmp_path))
+    
+    # Simulate download request with --write-info-json
+    req = DownloadRequest(
+        url="https://www.youtube.com/watch?v=sample123",
+        custom_args=["--write-info-json", "--skip-download"]
+    )
+    
+    # We mock asyncio.create_subprocess_exec to write an info.json file
+    async def mock_subprocess_exec(*args, **kwargs):
+        cwd = kwargs.get("cwd", str(tmp_path))
+        info_file = Path(cwd) / "Sample Video [sample123].info.json"
+        info_file.write_text('{"id": "sample123", "title": "Sample Video"}')
+
+        class MockStdout:
+            def __init__(self):
+                self._lines = [
+                    f"[info] Writing video metadata as JSON to: {info_file}\n".encode("utf-8"),
+                    b"[info] Finished downloading video metadata\n"
+                ]
+
+            async def read(self, n=4096):
+                if self._lines:
+                    return self._lines.pop(0)
+                return b""
+
+        class MockProcess:
+            def __init__(self):
+                self.stdout = MockStdout()
+                self.returncode = 0
+
+            async def wait(self):
+                return 0
+
+            async def communicate(self):
+                return b"", b""
+
+            def kill(self):
+                pass
+
+        return MockProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_subprocess_exec)
+
+    task_resp = await downloader_manager.start_download(req)
+    # Wait for completion
+    for _ in range(20):
+        await asyncio.sleep(0.1)
+        t = downloader_manager.get_task(task_resp.task_id)
+        if t and t.status in ["completed", "failed"]:
+            break
+
+    finished_task = downloader_manager.get_task(task_resp.task_id)
+    assert finished_task.status == "completed"
+    assert len(finished_task.files) == 1
+    assert finished_task.files[0].filename == "Sample Video [sample123].info.json"
+    assert finished_task.filename == "Sample Video [sample123].info.json"
+    assert len(finished_task.files[0].file_id) == 16
+
+    # Verify file can be retrieved by hex ID
+    found = downloader_manager.get_file_by_id_or_name(finished_task.files[0].file_id)
+    assert found is not None
+    assert found.exists()
+
 

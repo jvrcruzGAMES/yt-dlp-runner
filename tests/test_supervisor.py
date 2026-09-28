@@ -211,3 +211,30 @@ async def test_file_listing_and_hex_streaming_multi_format():
             for p in [test_video, test_sub, test_thumb, test_desc, test_json]:
                 if p.exists():
                     p.unlink()
+
+
+@pytest.mark.asyncio
+async def test_stream_subprocess_lines_handling_large_chunks_and_carriage_returns():
+    import asyncio
+    from app.downloader import stream_subprocess_lines
+
+    reader = asyncio.StreamReader()
+    
+    # 1. Feed a 100KB line without newlines (would cause LimitOverrunError in standard readline())
+    large_line = "A" * (100 * 1024)
+    reader.feed_data(f"{large_line}\n".encode("utf-8"))
+
+    # 2. Feed carriage return progress updates (\r)
+    reader.feed_data(b"[download]  10% of 100MB\r[download]  50% of 100MB\r\n[download] 100% of 100MB\n")
+    reader.feed_eof()
+
+    collected = []
+    async for line in stream_subprocess_lines(reader, chunk_size=2048):
+        collected.append(line)
+
+    assert len(collected) >= 4
+    assert collected[0] == large_line
+    assert "[download]  10% of 100MB" in collected
+    assert "[download]  50% of 100MB" in collected
+    assert "[download] 100% of 100MB" in collected
+

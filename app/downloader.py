@@ -97,6 +97,54 @@ def parse_speed_to_bytes_per_sec(speed_str: str) -> Optional[float]:
     return None
 
 
+async def stream_subprocess_lines(stream: asyncio.StreamReader, chunk_size: int = 4096):
+    """
+    Asynchronously yields lines from a subprocess StreamReader.
+    Safely handles arbitrary length streams, carriage returns (\r), and newlines (\n, \r\n)
+    without triggering asyncio.exceptions.LimitOverrunError.
+    """
+    buffer = ""
+    while True:
+        try:
+            chunk = await stream.read(chunk_size)
+        except Exception:
+            break
+        if not chunk:
+            break
+
+        buffer += chunk.decode("utf-8", errors="replace")
+
+        while True:
+            nl_pos = buffer.find("\n")
+            cr_pos = buffer.find("\r")
+
+            if nl_pos == -1 and cr_pos == -1:
+                # No delimiter in buffer; if buffer grows beyond 10MB, yield chunk to prevent unbounded memory
+                if len(buffer) > 10 * 1024 * 1024:
+                    yield buffer
+                    buffer = ""
+                break
+
+            if nl_pos != -1 and (cr_pos == -1 or nl_pos < cr_pos):
+                line = buffer[:nl_pos]
+                buffer = buffer[nl_pos + 1:]
+                yield line
+            elif cr_pos != -1:
+                if cr_pos + 1 < len(buffer) and buffer[cr_pos + 1] == "\n":
+                    line = buffer[:cr_pos]
+                    buffer = buffer[cr_pos + 2:]
+                elif cr_pos + 1 == len(buffer):
+                    # \r is at the very end of chunk, wait for next chunk
+                    break
+                else:
+                    line = buffer[:cr_pos]
+                    buffer = buffer[cr_pos + 1:]
+                yield line
+
+    if buffer:
+        yield buffer
+
+
 def generate_file_hex_id(filename: str, file_path: Optional[str] = None) -> str:
     """Generates a unique, deterministic 16-character hex identifier for a file."""
     salt = ""
@@ -296,16 +344,14 @@ class DownloadTaskManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(downloads_dir.resolve()),
+                limit=10 * 1024 * 1024,
             )
             self._subprocesses[task_id] = process
 
             explicit_paths: List[Path] = []
 
-            while True:
-                line_bytes = await process.stdout.readline()
-                if not line_bytes:
-                    break
-                raw_line = line_bytes.decode("utf-8", errors="replace").strip()
+            async for line_text in stream_subprocess_lines(process.stdout):
+                raw_line = line_text.strip()
                 if not raw_line:
                     continue
 

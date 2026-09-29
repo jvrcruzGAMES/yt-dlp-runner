@@ -40,7 +40,10 @@ class DownloadTaskResponse(BaseModel):
     task_id: str
     url: str
     status: str
-    progress_percent: float = 0.0
+    progress_percent: Optional[float] = Field(
+        default=None,
+        description="Current download progress percentage if reported by yt-dlp, otherwise None"
+    )
     downloaded_bytes: int = 0
     total_bytes: Optional[int] = None
     speed_bytes_per_sec: Optional[float] = None

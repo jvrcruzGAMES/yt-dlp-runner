@@ -37,12 +37,16 @@ SIZE_MULTIPLIERS = {
     "tb": 1000 ** 4,
 }
 
-PROGRESS_REGEX = re.compile(
-    r"\[download\]\s+([\d\.]+)%\s+of\s+(?:~)?([\d\.]+[a-zA-Z]+)(?:\s+at\s+([\d\.]+[a-zA-Z]+/s))?(?:\s+ETA\s+(\S+))?"
-)
-COMPLETE_PROGRESS_REGEX = re.compile(
-    r"\[download\]\s+100(?:\.0)?%\s+of\s+(?:~)?([\d\.]+[a-zA-Z]+)"
-)
+PROGRESS_PERCENT_REGEX = re.compile(r"\[download\]\s+([0-9]+(?:\.[0-9]+)?)%")
+TOTAL_SIZE_REGEX = re.compile(r"of\s+(?:~\s*)?([\d\.]+\s*[a-zA-Z]+)")
+SPEED_REGEX = re.compile(r"(?:at|speed)\s+([\d\.]+\s*[a-zA-Z]+/s)")
+ETA_REGEX = re.compile(r"ETA\s+([\d:]+)")
+
+POST_PROCESSING_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\[(?:Merger|ExtractAudio|VideoConvertor|Fixup[a-zA-Z0-9]+|Embed[a-zA-Z0-9]+|ModifyChapters|Thumbnail|ffmpeg)\]"),
+    re.compile(r"Deleting original file"),
+]
+
 DESTINATION_PATTERNS: List[re.Pattern] = [
     re.compile(r"\[(?:download|ExtractAudio|VideoConvertor|Fixup[a-zA-Z0-9]+|Embed[a-zA-Z0-9]+|ModifyChapters|Thumbnail)\]\s+Destination:\s+(.+)$"),
     re.compile(r"\[(?:Merger|Fixup[a-zA-Z0-9]+|ModifyChapters)\]\s+(?:Merging formats into|Correcting container in|Writing chapters to)\s+[\"']?([^\"'\n]+)[\"']?"),
@@ -57,6 +61,47 @@ MEDIA_EXTENSIONS: Set[str] = {
     ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".flac", ".aac"
 }
 TEMP_EXTENSIONS: Set[str] = {".part", ".ytdl", ".temp", ".tmp"}
+
+
+def extract_progress_info(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Extracts progress metrics from a yt-dlp log line.
+    Returns a dictionary containing properly formatted progress numbers if a percentage
+    is reported in the line, otherwise None.
+    """
+    m = PROGRESS_PERCENT_REGEX.search(line)
+    if not m:
+        return None
+
+    try:
+        raw_pct = float(m.group(1))
+        # Format properly as a clean float clamped between 0.0 and 100.0
+        pct = max(0.0, min(100.0, round(raw_pct, 2)))
+    except (ValueError, TypeError):
+        return None
+
+    info: Dict[str, Any] = {"progress_percent": pct}
+
+    size_m = TOTAL_SIZE_REGEX.search(line)
+    if size_m:
+        total_bytes = parse_size_to_bytes(size_m.group(1))
+        if total_bytes:
+            info["total_bytes"] = total_bytes
+            info["downloaded_bytes"] = int(total_bytes * (pct / 100.0))
+
+    speed_m = SPEED_REGEX.search(line)
+    if speed_m:
+        speed = parse_speed_to_bytes_per_sec(speed_m.group(1))
+        if speed:
+            info["speed_bytes_per_sec"] = speed
+
+    eta_m = ETA_REGEX.search(line)
+    if eta_m:
+        eta = parse_eta_to_seconds(eta_m.group(1))
+        if eta is not None:
+            info["eta_seconds"] = eta
+
+    return info
 
 
 def parse_size_to_bytes(size_str: str) -> Optional[int]:
@@ -285,6 +330,7 @@ class DownloadTaskManager:
             task_id=task_id,
             url=request.url,
             status="pending",
+            progress_percent=None,
             started_at=datetime.datetime.now(datetime.timezone.utc),
             logs=[f"Task queued at {datetime.datetime.now(datetime.timezone.utc).isoformat()}"],
         )
@@ -383,30 +429,26 @@ class DownloadTaskManager:
                 if "ERROR:" in raw_line or "error:" in raw_line.lower():
                     last_error_message = raw_line
 
-                # Parse progress percentage, size, speed, ETA
-                prog_match = PROGRESS_REGEX.search(raw_line)
-                if prog_match:
-                    try:
-                        pct = float(prog_match.group(1))
-                        task.progress_percent = pct
-                        total_str = prog_match.group(2)
-                        total_bytes = parse_size_to_bytes(total_str)
-                        if total_bytes:
-                            task.total_bytes = total_bytes
-                            task.downloaded_bytes = int(total_bytes * (pct / 100.0))
+                # Parse latest progress percentage, size, speed, ETA if present
+                prog_info = extract_progress_info(raw_line)
+                if prog_info is not None:
+                    task.progress_percent = prog_info["progress_percent"]
+                    if "total_bytes" in prog_info:
+                        task.total_bytes = prog_info["total_bytes"]
+                        task.downloaded_bytes = prog_info["downloaded_bytes"]
+                    if "speed_bytes_per_sec" in prog_info:
+                        task.speed_bytes_per_sec = prog_info["speed_bytes_per_sec"]
+                    if "eta_seconds" in prog_info:
+                        task.eta_seconds = prog_info["eta_seconds"]
+                    if task.progress_percent >= 100.0 and task.status == "downloading":
+                        task.status = "processing"
 
-                        speed_str = prog_match.group(3)
-                        if speed_str:
-                            task.speed_bytes_per_sec = parse_speed_to_bytes_per_sec(speed_str)
-
-                        eta_str = prog_match.group(4)
-                        if eta_str:
-                            task.eta_seconds = parse_eta_to_seconds(eta_str)
-                    except Exception:
-                        pass
-                elif COMPLETE_PROGRESS_REGEX.search(raw_line):
-                    task.progress_percent = 100.0
-                    task.status = "processing"
+                # Check for post-processing / merger stages
+                for p_pat in POST_PROCESSING_PATTERNS:
+                    if p_pat.search(raw_line):
+                        task.status = "processing"
+                        task.progress_percent = 100.0
+                        break
 
                 # Parse destination and written file paths from all patterns
                 for pat in DESTINATION_PATTERNS:

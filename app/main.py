@@ -81,6 +81,7 @@ async def info():
     return {
         "app": settings.APP_NAME,
         "version": settings.APP_VERSION,
+        "user_id": settings.USER_ID,
         "commit_sha": runner_integrity.get_commit_sha(),
         "image_ref": image_ref,
         "image_digest": image_digest,

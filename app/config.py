@@ -27,6 +27,8 @@ class RunnerSettings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8080
 
+    USER_ID: Optional[str] = os.getenv("USER_ID", None)
+
     DOWNLOADS_DIR: str = _default_downloads_dir()
     COOKIES_DIR: str = _default_cookies_dir()
 
